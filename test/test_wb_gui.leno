@@ -1,0 +1,28 @@
+// test/test_wb_gui.leno — GUI 无头自检的包装（把它并进常规测试套件）
+//
+// 为什么用子进程：GUI 会**建窗口并进主循环**，自检跑完自己 `_exit`。
+// 放在子进程里 ⇒ 主测试进程不被窗口拖住，退出码就是结论 ✓
+// （与 test_wb_flow 起 stub 服务端是同一套思路：被测对象该隔离就隔离）
+import strings
+import files
+import dirs
+
+main() {
+    var gui = dirs.join(dirs.dirname(dirs.script_dir()), "wb_gui.leno")
+    if not files.exists(gui) {
+        print("✗ 找不到 " + gui)
+        _exit(1)
+    }
+    // 无头 + 自检 + 配置关进临时目录（不碰真实 wb_gui.json / wb_state.json）
+    _env("SDL_VIDEODRIVER", "dummy")
+    _env("WORKBUDDY_GUI_SELFTEST", "1")
+    _env("WORKBUDDY_DATA_DIR", dirs.join(_tmpdir(), "wb_gui_selftest"))
+    var r = _exec(_executable() + " " + gui, 120000)
+    print(r.output)
+    if r.code == 0 {
+        print("test_wb_gui passed")
+    } else {
+        print("test_wb_gui FAILED（退出码 " + _str(r.code) + "）")
+    }
+    _exit(r.code)
+}

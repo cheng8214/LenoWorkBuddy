@@ -1,0 +1,402 @@
+// wb_core.leno — WorkBuddy 自动签到：基础设施层
+//   ① 时间预算（跑穿计划任务时限 = 当天日志整条丢失 ⇒ 自设更小的预算）
+//   ② HTTP（带退避重试；失败码区分"网络不可达 / 服务端抖动 / 业务拒绝"）
+//   ③ JSON 取值（`dig` 兼容 data/result 信封；标量安全转换）
+//   ④ 输出（一行 JSON；silent 模式写日志文件；token 脱敏）
+//
+// 约定：本文件**不打印**、不含 `main()` ⇒ 可被 CLI 与 GUI 共用 ✓
+import jsons
+import strings
+import files
+import dirs
+import times
+import "web_net" as net
+use net.(HttpClient, Response)
+
+// ==================== 常量 ====================
+export var DEFAULT_ENDPOINT = "https://copilot.tencent.com"
+
+// 伪 HTTP 码：区分"没拿到响应"的两种原因（真状态码都是 >= 100 的正数）
+export var CODE_NO_NETWORK = -1   // 连不上 / 超时
+export var CODE_BUDGET_OUT = -2   // 本次运行的时间预算已耗尽，主动放弃后续请求
+
+// 计划任务跑满 ExecutionTimeLimit 会被系统直接杀掉，届时 emit 还没执行、当天日志整条丢失。
+// 这里自设更小的预算，确保总能走到写日志那一步。两个任务的时限不同（签到 PT10M / 轮询 PT5M），
+// 上限也必须分开算，各留 60s 给解释器启动和收尾。
+var DEFAULT_BUDGET_SECONDS = 420.0
+var MAX_BUDGET_SECONDS = 540.0
+var POLL_BUDGET_SECONDS = 180.0
+var POLL_MAX_BUDGET_SECONDS = 240.0
+export var REQUEST_TIMEOUT = 30
+
+// 网络类失败的退避节奏（秒）。定时任务最容易撞上"刚开机/刚唤醒"：WiFi 重连、DHCP 续租、
+// VPN 拨通往往要几十秒 ⇒ 退避到分钟级才真正跨得过这个窗口（最多 6 次尝试摊开约 3.5 分钟）。
+var NETWORK_RETRY_DELAYS = [5, 15, 30, 60, 90]
+// 5xx 是服务端抖动，不是本机网络没就绪：短促重试即可（干等几分钟既救不了它，还会把预算耗光）
+var SERVER_RETRY_DELAYS = [3, 10]
+
+// `dig` 兼容的信封字段（响应可能被 data/result/resp/response 包一层）
+var ENVELOPES = ["data", "result", "resp", "response"]
+
+// 需要人关注的结果码（emit 据此补 needs_attention）
+var ATTENTION_RESULTS = ["ERROR", "UNKNOWN", "NETWORK", "TIMEOUT", "NO_AUTH", "NO_SESSION",
+                         "AUTH_ERROR", "AUTH_REJECTED", "FORBIDDEN"]
+
+// ==================== ① 时间预算 ====================
+// 为什么不用 `times.now()`（挂钟）：挂钟会被 NTP 校时、夏令时往回拨 ⇒ 预算算出负数或虚高。
+// `times.ms()` 是进程内单调累计毫秒，正是这里需要的。
+var _started_ms = 0.0
+var _budget_seconds = 420.0
+var _config_warning = ""
+
+struct Budget {
+    float seconds = 420.0
+    string warning = ""
+}
+
+// 解析预算环境变量。非法值/越界值一律夹到安全区间 —— **绝不能在这里抛异常**：
+// 这个坑踩过：异常会在 main 的 try/except 生效之前把进程打崩，silent 模式下当天日志整条为空
+export func parse_budget(float def, float maximum): Budget {
+    var raw = _env_or("WORKBUDDY_BUDGET_SECONDS", "")
+    if raw == "" { return new Budget(seconds = def, warning = "") }
+    var parsed = try_float(raw)
+    if not parsed.ok {
+        return new Budget(seconds = def,
+            warning = "WORKBUDDY_BUDGET_SECONDS=" + raw + " 不是数字，已回落 " + _str(_int(def)) + " 秒")
+    }
+    if parsed.value <= 0.0 {
+        // "0" 是非空字符串，用 `or` 兜不住；且 0 会让每个请求都直接放弃，脚本永久失效
+        return new Budget(seconds = def,
+            warning = "WORKBUDDY_BUDGET_SECONDS=" + raw + " 必须为正数，已回落 " + _str(_int(def)) + " 秒")
+    }
+    if parsed.value > maximum {
+        // 上限同样是硬要求：预算大于任务时限就等于没有预算，黑洞式超时会把进程跑到被强杀
+        return new Budget(seconds = maximum,
+            warning = "WORKBUDDY_BUDGET_SECONDS=" + raw + " 超过本命令上限，已夹到 " + _str(_int(maximum))
+                      + " 秒（须小于该定时任务的 ExecutionTimeLimit）")
+    }
+    return new Budget(seconds = parsed.value, warning = "")
+}
+
+// 轮询类命令（silent-poll / silent-growth）预算更短、上限更低
+export func start_budget(string action) {
+    var poll = action == "silent-poll" or action == "silent-growth"
+    var def = DEFAULT_BUDGET_SECONDS
+    var maximum = MAX_BUDGET_SECONDS
+    if poll {
+        def = POLL_BUDGET_SECONDS
+        maximum = POLL_MAX_BUDGET_SECONDS
+    }
+    var b = parse_budget(def, maximum)
+    _budget_seconds = b.seconds
+    _config_warning = b.warning
+    _started_ms = times.ms()
+}
+
+export func budget_left(): float {
+    if _started_ms <= 0.0 { return _budget_seconds }
+    return _budget_seconds - (times.ms() - _started_ms) / 1000.0
+}
+
+export func config_warning(): string { return _config_warning }
+
+// 单次请求的超时上限随剩余预算收缩（预算不够就别开始：宁可如实返回失败，也不能跑穿时限被强杀）
+func request_timeout_s(): int {
+    var left = _int(budget_left())
+    if left < 1 { left = 1 }
+    if left > REQUEST_TIMEOUT { left = REQUEST_TIMEOUT }
+    return left
+}
+
+// ==================== ② HTTP ====================
+struct ApiResp {
+    int code = 0
+    Dict[string, any] body = {}
+}
+
+export func new_client(int timeout_ms): HttpClient {
+    net.globalInit()
+    HttpClient c = net.createClient()
+    c.setTimeout(timeout_ms)
+    return c
+}
+
+// 响应 → ApiResp。statusCode == 0 ⇒ libcurl 层就没拿到响应（连不上/超时）⇒ 伪码 CODE_NO_NETWORK。
+// 解析失败不抛异常：把原文前 500 字符装进 {raw: ...}（兜底）
+func to_resp(Response r): ApiResp {
+    if r.statusCode == 0 {
+        return new ApiResp(code = CODE_NO_NETWORK, body = {"error": r.error})
+    }
+    var text = r.body
+    try {
+        var parsed = jsons.decode(text)
+        if parsed is Dict => d {
+            return new ApiResp(code = r.statusCode, body = d)
+        }
+    } catch e {
+        var _bad_json = true
+    }
+    // 非对象（数组/标量/解析失败）也包成对象：调用点只认 Dict，少一层判断
+    return new ApiResp(code = r.statusCode, body = {"raw": clip(text, 500)})
+}
+
+// 一次请求（不做重试）。payload == "" ⇒ 不带 body（GET；空 POST 用 "{}"）
+func raw_request(HttpClient c, string url, string method, string payload): ApiResp {
+    c.setTimeout(request_timeout_s() * 1000)
+    if method == "POST" {
+        if payload == "" {
+            return to_resp(c.post(url, "{}"))
+        }
+        return to_resp(c.post(url, payload))
+    }
+    return to_resp(c.get(url))
+}
+
+// 该失败码对应的退避节奏；空数组 = 重试也没用（4xx 是业务规则，重试一百次也是同一个答案）
+func retry_delays(int code): Array[int] {
+    if code == CODE_NO_NETWORK { return NETWORK_RETRY_DELAYS }
+    if code >= 500 { return SERVER_RETRY_DELAYS }
+    return []
+}
+
+// 带时间预算的请求：失败按退避节奏重试，预算不够就提前收尾。
+// 返回 CODE_BUDGET_OUT 表示"没发出去，因为再发就要超出任务时限了"。
+//
+// 退避进度按**失败类型**各记一份，而不是一个全局计数：失败类型会在重试途中变化
+// （典型是冷启动——前几次网络不可达，之后转成 500 代理还没就绪），全局计数会让这种 5xx
+// 撞上已经用光的计数、一次都重试不到。分桶后每类各走自己的退避表，总次数仍有界。
+export func request(HttpClient c, string url, string method, string payload, bool retry): ApiResp {
+    if budget_left() <= 1.0 {
+        return new ApiResp(code = CODE_BUDGET_OUT, body = {"error": "已达本次运行时间预算，跳过剩余请求"})
+    }
+    var r = raw_request(c, url, method, payload)
+    if not retry { return r }
+    var net_used = 0
+    var srv_used = 0
+    while true {
+        var delay = 0
+        if r.code == CODE_NO_NETWORK {
+            if net_used >= NETWORK_RETRY_DELAYS.len() { return r }
+            delay = NETWORK_RETRY_DELAYS[net_used]
+            net_used = net_used + 1
+        } else if r.code >= 500 {
+            if srv_used >= SERVER_RETRY_DELAYS.len() { return r }
+            delay = SERVER_RETRY_DELAYS[srv_used]
+            srv_used = srv_used + 1
+        } else {
+            return r
+        }
+        // 一轮重试最坏要占掉 delay + 一整个超时，预算不够就别开始
+        if budget_left() <= (_float(delay) + _float(REQUEST_TIMEOUT)) { return r }
+        sleep(delay * 1000)
+        r = raw_request(c, url, method, payload)
+    }
+    return r
+}
+
+// POST 默认不重试：抽奖/领奖等写操作若在服务端处理完成后才超时，重试会重复提交。
+// 两个签到接口例外 —— 状态查询是只读的，领取接口本身幂等（当天重复领取只会返回"已签"）。
+export func post(HttpClient c, string url, string payload, bool retry): ApiResp {
+    return request(c, url, "POST", payload, retry)
+}
+
+export func get_json(HttpClient c, string url): ApiResp {
+    return request(c, url, "GET", "", true)
+}
+
+// ==================== ③ JSON 取值 ====================
+// 在可能被 data/result 包裹的响应里找字段，兼容信封结构（挖不到 ⇒ null）
+export func dig(Dict[string, any] obj, string key): any {
+    if obj.has(key) {
+        var v = obj.get(key)
+        if v != null { return v }
+    }
+    for ENVELOPES to k {
+        if obj.has(k) {
+            var inner = obj.get(k)
+            if inner is Dict => d {
+                var r = dig(d, key)
+                if r != null { return r }
+            }
+        }
+    }
+    return null
+}
+
+// ---- 标量安全转换 ----
+// ⚠ 这里**不用 try/catch 试探**：`_int("12x")` 这类失败在本机是"静默给 0"，
+//   靠异常分不出来 ⇒ 一律先看类型、再做字符校验，语义才可预测 ✓
+struct Num {
+    bool ok = false
+    float value = 0.0
+}
+
+func try_float(string s): Num {
+    var t = s.trim()
+    if t == "" { return new Num(ok = false, value = 0.0) }
+    var f = 0.0
+    try { f = _float(t) } catch e { return new Num(ok = false, value = 0.0) }
+    return new Num(ok = true, value = f)
+}
+
+// 纯整数串（可带前导 -）⇒ <0, true>
+func is_int_str(string t): bool {
+    if t == "" { return false }
+    int i = 0
+    if t.byte(0) == 45 { i = 1 }          // 45 = '-'
+    if i >= t.len() { return false }
+    while i < t.len() {
+        int b = t.byte(i)
+        if b < 48 or b > 57 { return false }   // 48..57 = '0'..'9'
+        i = i + 1
+    }
+    return true
+}
+
+export func as_int(any v, int def): int {
+    if v == null { return def }
+    if v is int => i { return i }
+    if v is bool => b {
+        if b { return 1 }
+        return 0
+    }
+    if v is float => f { return _int(f) }
+    if v is string => s {
+        var t = s.trim()
+        if is_int_str(t) { return _int(t) }
+        var f = try_float(t)
+        if f.ok { return _int(f.value) }   // 兼容 "1.5"/"1e3"：宁可截断，也不把真实数值丢成 0
+        return def
+    }
+    return def
+}
+
+export func as_float(any v, float def): float {
+    if v == null { return def }
+    if v is float => f { return f }
+    if v is int => i { return _float(i) }
+    if v is string => s {
+        var f = try_float(s)
+        if f.ok { return f.value }
+    }
+    return def
+}
+
+export func as_bool(any v): bool {
+    if v == null { return false }
+    if v is bool => b { return b }
+    if v is int => i { return i != 0 }
+    if v is string => s { return s == "true" or s == "1" }
+    return false
+}
+
+// 积分等数值的展示串：能转 int 就转，否则原样
+export func fmt_credit(any v): string {
+    if v == null { return "null" }
+    if v is string => s { return s }
+    if v is float => f { return _str(_int(f)) }
+    if v is bool => b { return _str(b) }
+    return _str(_int(v))
+}
+
+// 取 s 的前 n 个字符（仅用于诊断输出的截断，绝不参与业务判断）
+export func clip(string s, int n): string {
+    if s.len() <= n { return s }
+    return s.slice(0, n - 1)
+}
+
+// ==================== ④ 输出与脱敏 ====================
+var _sensitive = []
+
+export func add_sensitive(string v) {
+    if v != "" { _sensitive.add(v) }
+}
+
+// 序列化 + 脱敏。这是唯一的输出通道，绝不能因为一个怪值就崩掉
+// （兜底成一行可读的错误串）。
+export func encode_redacted(Dict[string, any] out): string {
+    var text = ""
+    try {
+        text = jsons.encode(out)
+    } catch e {
+        text = "{\"result\":\"ERROR\",\"report\":\"结果序列化失败\"}"
+    }
+    for _sensitive to v { text = text.replace(v, "[REDACTED]") }
+    return text
+}
+
+func now_text(): string {
+    return times.format(times.now(), "%Y-%m-%d %H:%M:%S")
+}
+
+// silent 类模式写日志文件，其余模式打印到 stdout。
+// 判定用**前缀**而不是等号：silent-poll / silent-growth 同样是无窗口跑的，
+// 无窗口时 stdout 等于扔进黑洞 ⇒ 最需要人处理的结果会一条不剩地消失。
+// ERROR 两条通道都走：计划任务里若把命令名写错（silent 拼错），走 stdout 就没有任何痕迹了。
+export func emit(Dict[string, any] out, string action) {
+    var d = out
+    if not d.has("needs_attention") {
+        var result = jsons.get_str(d, "result", "")
+        d.set("needs_attention", _in_list(ATTENTION_RESULTS, result))
+    }
+    if _config_warning != "" { d.set("config_warning", _config_warning) }
+    var payload = encode_redacted(d)
+    var is_error = jsons.get_str(d, "result", "") == "ERROR"
+    if not strings.starts_with(action, "silent") {
+        try {
+            print(payload)
+            if not is_error { return }
+        } catch e {
+            // stdout 不可用（编码/管道问题）时退到日志，至少不把结果丢掉
+            var _stdout_down = true
+        }
+    }
+    var line = "[" + now_text() + "] " + payload + "\n"
+    var default_log = dirs.join(dirs.script_dir(), "signin.log")
+    var custom = _env_or("WORKBUDDY_SIGNIN_LOG", "")
+    var paths = []
+    if custom != "" { paths.add(custom) }
+    paths.add(default_log)
+    // 自定义路径不可写时回退到脚本同目录，避免无窗口运行下结果彻底丢失
+    for paths to p {
+        try {
+            var f = files.open(p, "a")
+            f.write(line)
+            f.close()
+            return
+        } catch e {
+            var _log_failed = p
+        }
+    }
+}
+
+func _in_list(Array[string] list, string v): bool {
+    for list to x {
+        if x == v { return true }
+    }
+    return false
+}
+
+// ==================== 失败码人话化 ====================
+export func http_label(int code): string {
+    if code == CODE_NO_NETWORK { return "网络不可达" }
+    if code == CODE_BUDGET_OUT { return "时间预算耗尽" }
+    return "HTTP " + _str(code)
+}
+
+// 是否属于"需要人关注"的失败：5xx 与"没拿到响应"算；4xx 绝大多数是业务规则
+// （派 Buddy 已达每日上限、活动已结束），若计入会让计划任务天天报红
+export func is_hard_failure(int code): bool {
+    return code >= 500 or code == CODE_NO_NETWORK or code == CODE_BUDGET_OUT
+}
+
+// 认证/权限拒绝（调用方据此结束本轮）
+export func is_auth_code(int code): bool {
+    return code == 401 or code == 403
+}
+
+// 环境变量开关型判定：空串与 0/false/no/off 一律视为关
+export func env_flag(string name): bool {
+    var v = _env_or(name, "").trim().to_lower()
+    return v == "1" or v == "true" or v == "yes" or v == "on"
+}

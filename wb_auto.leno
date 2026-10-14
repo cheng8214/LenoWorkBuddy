@@ -1,0 +1,237 @@
+// wb_auto.leno — 进程内定时 + 配置/状态落盘
+//
+// 为什么是"进程内定时"而不是系统计划任务：
+//   ① GUI 常驻托盘 ⇒ **它自己就是定时器**，不必再去建计划任务；
+//   ② 计划任务那条路有一串环境坑（找不到解释器、工作目录不对、无窗口看不到输出），
+//      而进程内定时只要程序在跑就一定准时；
+//   ③ 与 CLI 的 `silent`/`silent-poll` **互不冲突**：签到接口幂等，两边都跑也只会得到 ALREADY。
+//   代价：程序没运行时不会自动签到（所以配了"开机自启动" + 启动时空跑一次补签 ✓）。
+import jsons
+import strings
+import files
+import dirs
+import times
+import Sys
+
+var APP_DIR = "LenoWorkBuddy"
+
+// ==================== 配置 ====================
+export struct AutoCfg {
+    bool signin_on = true            // 定时签到总开关
+    string signin_at = "00:05"       // 每天几点（本地时间，HH:MM）
+    bool poll_on = true              // 轮询成长中心（领旅行礼物 / 领任务奖等）
+    int poll_minutes = 120           // 轮询间隔（分钟）
+    bool close_to_tray = true        // 关窗 = 收进托盘（不退出）
+}
+
+// ==================== 运行状态（只用于显示与"今天是否已自动签过"）====================
+export struct AutoState {
+    string signed_date = ""          // 已自动签到的日期 yyyy-mm-dd（**按本地日期**，跨天自动重置）
+    string last_poll_date = ""
+    int last_poll_min = -1           // 上次轮询的"当日分钟数"，-1 = 没轮询过
+    string last_text = ""            // 最近一次动作的汇报文案
+    string last_at = ""              // 最近一次动作的时间
+    string today_status = "未知"      // 今日签到状态（显示用）
+    string streak = "—"
+    string total = "—"
+    string energy = "—"
+}
+
+// 配置目录：优先系统配置目录（Windows = %APPDATA%），取不到就退回脚本目录
+// （退回是"可写但难看"优于"写不进去" —— 打包成单文件放在 Program Files 时尤其重要）
+// WORKBUDDY_DATA_DIR 是**测试钩子**：自检/回归用它把配置与状态关进临时目录，绝不碰真实文件 ✓
+func data_root(): string {
+    var override = _env_or("WORKBUDDY_DATA_DIR", "").trim()
+    var base = override
+    if base == "" {
+        try { base = Sys.configDir() } catch e { base = "" }
+    }
+    if base == "" { base = dirs.script_dir() }
+    var root = dirs.join(base, APP_DIR)
+    if override != "" { root = base }
+    try { dirs.mkdir_p(root) } catch e { var _mkdir_failed = true }
+    return root
+}
+
+func cfg_path(): string { return dirs.join(data_root(), "wb_gui.json") }
+
+export func default_cfg(): AutoCfg { return new AutoCfg() }
+
+export func load_cfg(): AutoCfg {
+    var out = new AutoCfg()
+    var path = cfg_path()
+    if not files.exists(path) { return out }
+    var d = null
+    try { d = jsons.decode(files.read(path)) } catch e { return out }   // 坏文件 ⇒ 用默认值（不崩、不覆盖）
+    var m = d as Dict[string, any]
+    if m == null { return out }
+    out.signin_on = read_bool(m, "signin_on", out.signin_on)
+    out.signin_at = read_time(m, "signin_at", out.signin_at)
+    out.poll_on = read_bool(m, "poll_on", out.poll_on)
+    // 间隔也要**在装载时**校验：坏值（-3 / 0 / 99999）若原样吃进来，
+    //   `poll_due` 会把下限压到 5 分钟 ⇒ 变成"不停打接口"。宁可回落默认值 ✓
+    var gap = read_int(m, "poll_minutes", out.poll_minutes)
+    if gap < 5 or gap > 1440 { gap = out.poll_minutes }
+    out.poll_minutes = gap
+    out.close_to_tray = read_bool(m, "close_to_tray", out.close_to_tray)
+    return out
+}
+
+export func save_cfg(AutoCfg c): bool {
+    var m = {
+        "signin_on": c.signin_on,
+        "signin_at": c.signin_at,
+        "poll_on": c.poll_on,
+        "poll_minutes": c.poll_minutes,
+        "close_to_tray": c.close_to_tray
+    }
+    try {
+        files.write(cfg_path(), jsons.encode(m))
+        return true
+    } catch e {
+        return false
+    }
+}
+
+func read_bool(Dict[string, any] m, string k, bool def): bool {
+    var v = m.get(k)
+    if v is bool => b { return b }
+    return def
+}
+
+func read_int(Dict[string, any] m, string k, int def): int {
+    var v = m.get(k)
+    if v is int => i { return i }
+    return def
+}
+
+// 时间字段必须是合法 HH:MM —— 存进去就一定是合法的（下面 parse_hhmm 是唯一校验口径）
+func read_time(Dict[string, any] m, string k, string def): string {
+    var v = m.get(k)
+    if v is string => s {
+        if parse_hhmm(s) >= 0 { return s }
+    }
+    return def
+}
+
+// ==================== 时间小工具 ====================
+// "HH:MM" → 当日分钟数；非法返回 -1（唯一校验口径：别处不许再各写一份判断）
+export func parse_hhmm(string s): int {
+    var t = s.trim()
+    if t.len() != 5 { return -1 }
+    if t.byte(2) != 58 { return -1 }         // ':'
+    var h = 0
+    var m = 0
+    for 0:4 to i {
+        if i == 2 { continue }
+        var b = t.byte(i)
+        if b < 48 or b > 57 { return -1 }
+        if i < 2 { h = h * 10 + (b - 48) } else { m = m * 10 + (b - 48) }
+    }
+    if h > 23 or m > 59 { return -1 }
+    return h * 60 + m
+}
+
+export func fmt_minutes(int min): string {
+    var v = min
+    if v < 0 { v = 0 }
+    var h = v / 60
+    var m = v % 60
+    var hs = _str(h)
+    if h < 10 { hs = "0" + hs }
+    var ms = _str(m)
+    if m < 10 { ms = "0" + ms }
+    return hs + ":" + ms
+}
+
+// 本地日期 yyyy-mm-dd 与当日分钟数（两者都取自**同一个时刻**，避免跨午夜时前后不一致）
+export func now_parts(): Array[string] {
+    var t = times.now()
+    return [times.format(t, "%Y-%m-%d"), times.format(t, "%H:%M"), times.format(t, "%H:%M:%S")]
+}
+
+// ==================== 调度判定（纯函数 ⇒ 可离线断言）====================
+// 定时签到是否该触发：
+//   · 总开关关着 ⇒ 不触发
+//   · 今天已经自动签过 ⇒ 不再触发（**幂等靠这里挡**，服务端那条只是兜底）
+//   · 还没到点 ⇒ 不触发
+export func signin_due(AutoCfg c, AutoState st, string today, int now_min): bool {
+    if not c.signin_on { return false }
+    if st.signed_date == today { return false }
+    var at = parse_hhmm(c.signin_at)
+    if at < 0 { at = parse_hhmm("00:05") }
+    return now_min >= at
+}
+
+// 轮询是否该触发：跨天必触发；同一天按间隔算（间隔下限 5 分钟，避免配置写 0 变成打接口）
+export func poll_due(AutoCfg c, AutoState st, string today, int now_min): bool {
+    if not c.poll_on { return false }
+    if st.last_poll_date != today { return true }
+    if st.last_poll_min < 0 { return true }
+    var gap = c.poll_minutes
+    if gap < 5 { gap = 5 }
+    return now_min - st.last_poll_min >= gap
+}
+
+// 定时签到的"下次/当前"提示（底部状态行 + 托盘提示都用它）
+export func signin_hint(AutoCfg c, AutoState st, string today, int now_min): string {
+    if not c.signin_on { return "定时签到：已关闭" }
+    var at = parse_hhmm(c.signin_at)
+    if at < 0 { at = 5 }
+    if st.signed_date == today { return "定时签到：今天 " + fmt_minutes(at) + " 已完成" }
+    if now_min >= at { return "定时签到：已过 " + fmt_minutes(at) + "，本拍执行" }
+    return "定时签到：下次今天 " + fmt_minutes(at) + "（还有 " + _str(at - now_min) + " 分钟）"
+}
+
+export func poll_hint(AutoCfg c, AutoState st, string today, int now_min): string {
+    if not c.poll_on { return "成长中心：已关闭" }
+    var gap = c.poll_minutes
+    if gap < 5 { gap = 5 }
+    if st.last_poll_date != today or st.last_poll_min < 0 { return "成长中心：本拍轮询" }
+    var left = gap - (now_min - st.last_poll_min)
+    if left < 0 { left = 0 }
+    return "成长中心：约 " + _str(left) + " 分钟后轮询"
+}
+
+// ==================== 状态落盘 ====================
+func state_path(): string { return dirs.join(data_root(), "wb_state.json") }
+
+export func load_state(): AutoState {
+    var out = new AutoState()
+    var path = state_path()
+    if not files.exists(path) { return out }
+    var d = null
+    try { d = jsons.decode(files.read(path)) } catch e { return out }
+    var m = d as Dict[string, any]
+    if m == null { return out }
+    out.signed_date = jsons.get_str(m, "signed_date", "")
+    out.last_poll_date = jsons.get_str(m, "last_poll_date", "")
+    out.last_poll_min = read_int(m, "last_poll_min", -1)
+    out.last_text = jsons.get_str(m, "last_text", "")
+    out.last_at = jsons.get_str(m, "last_at", "")
+    out.today_status = jsons.get_str(m, "today_status", "未知")
+    out.streak = jsons.get_str(m, "streak", "—")
+    out.total = jsons.get_str(m, "total", "—")
+    out.energy = jsons.get_str(m, "energy", "—")
+    return out
+}
+
+export func save_state(AutoState s): bool {
+    var m = {
+        "signed_date": s.signed_date,
+        "last_poll_date": s.last_poll_date,
+        "last_poll_min": s.last_poll_min,
+        "last_text": s.last_text,
+        "last_at": s.last_at,
+        "today_status": s.today_status,
+        "streak": s.streak,
+        "total": s.total,
+        "energy": s.energy
+    }
+    try {
+        files.write(state_path(), jsons.encode(m))
+        return true
+    } catch e {
+        return false
+    }
+}

@@ -1,0 +1,500 @@
+// wb_gui.leno — WorkBuddy 签到助手（窗口 + 托盘）
+//
+// 界面只做三件事：**看状态**（今日/连签/累计/能量）、**手动触发**（签到 / 查状态 / 检查凭据）、
+// **设自动化**（定时签到 / 轮询成长中心 / 开机自启 / 关窗收进托盘）。
+// 所有业务逻辑都在 wb_checkin / wb_growth / wb_auth 里 —— 这里只负责把结果画出来、把点击接上去 ✓
+//
+// 用法：
+//   leno wb_gui.leno                 正常开窗
+//   leno wb_gui.leno --tray          启动即只留托盘（开机自启用它）
+//   WORKBUDDY_GUI_AUTO=120           跑 120 帧后打印摘要并退出（无头冒烟：配 SDL_VIDEODRIVER=dummy）
+//   WORKBUDDY_GUI_SELFTEST=1         逐项跑动作并断言状态变化，然后退出（不建托盘、不写真实配置）
+//   WORKBUDDY_GUI_NO_NET=1           不联网（离线验证界面）
+import jsons
+import strings
+import dirs
+import times
+import SDL3
+import "wb_core.leno" as core
+import "wb_auth.leno" as auth
+import "wb_checkin.leno" as checkin
+import "wb_growth.leno" as growth
+import "wb_auto.leno" as auto
+import "wb_tray.leno" as tray
+use SDL3.(Event, Renderer, Scancode, Label, Window, Button, Toggle, Edit, Badge)
+use auto.(AutoCfg, AutoState)
+
+// ==================== 状态 ====================
+AutoCfg CFG = auto.default_cfg()
+AutoState ST = new AutoState()
+var STATUS_TEXT = "就绪"
+var TODAY_TEXT = "今日：未知"
+var STATS_TEXT = "连签 —　累计 —　能量 —"
+var HINT_TEXT = ""
+var BADGE_TEXT = "未知"
+var AUTO_SELFTEST = false
+var NO_NET = false
+var AUTO_FRAMES = 0
+var FRAMES = 0
+var _c_today = ""
+var _c_stats = ""
+var _c_status = ""
+var _c_hint = ""
+var _c_badge = ""
+var _sfFail = 0
+var _sfPass = 0
+
+// ==================== 视图刷新（只写变化过的 Label：每帧重建纹理是这个库的已知开销）====================
+func apply_view(Label todayLbl, Label statsLbl, Label statusLbl, Label hintLbl, Badge badge) {
+    if _c_today != TODAY_TEXT { todayLbl.set_text(TODAY_TEXT); _c_today = TODAY_TEXT }
+    if _c_stats != STATS_TEXT { statsLbl.set_text(STATS_TEXT); _c_stats = STATS_TEXT }
+    if _c_status != STATUS_TEXT { statusLbl.set_text(STATUS_TEXT); _c_status = STATUS_TEXT }
+    if _c_hint != HINT_TEXT { hintLbl.set_text(HINT_TEXT); _c_hint = HINT_TEXT }
+    if _c_badge != BADGE_TEXT { badge.set_text(BADGE_TEXT); _c_badge = BADGE_TEXT }
+}
+
+func refresh_today() {
+    TODAY_TEXT = "今日：" + ST.today_status
+    STATS_TEXT = "连签 " + ST.streak + " 天　累计 " + ST.total + " 积分　能量 " + ST.energy
+    BADGE_TEXT = ST.today_status
+}
+
+func refresh_hints() {
+    var np = auto.now_parts()
+    var now_min = auto.parse_hhmm(np[1])
+    var today = np[0]
+    HINT_TEXT = auto.signin_hint(CFG, ST, today, now_min) + "　|　" + auto.poll_hint(CFG, ST, today, now_min)
+}
+
+func note_result(string text) {
+    STATUS_TEXT = text
+    var np = auto.now_parts()
+    ST.last_text = text
+    ST.last_at = np[0] + " " + np[1]
+    auto.save_state(ST)
+}
+
+// ==================== 动作 ====================
+// 连接（找凭据 → 解 token → 建客户端）。失败时把**人话**放进状态行，并返回 ok=false
+func open_conn(): auth.Conn {
+    var c = auth.connect()
+    if not c.ok { note_result(c.err) }
+    return c
+}
+
+func do_status() {
+    if NO_NET {
+        ST.today_status = "离线"
+        STATUS_TEXT = "离线模式（WORKBUDDY_GUI_NO_NET=1）：未查询接口"
+        refresh_today()
+        return
+    }
+    var c = open_conn()
+    if not c.ok { return }
+    var cl = c.client
+    if cl == null { note_result("内部错误：连接已失效"); return }
+    var r = checkin.fetch_status(cl, c.endpoint)
+    if r.code == core.CODE_NO_NETWORK {
+        ST.today_status = "网络不可达"
+        note_result("网络不可达：" + jsons.get_str(r.body, "error", "请检查网络"))
+        refresh_today()
+        return
+    }
+    if core.is_auth_code(r.code) {
+        ST.today_status = "凭据被拒"
+        note_result(jsons.get_str(auth.http_auth_failure(r.code), "report", core.http_label(r.code)))
+        refresh_today()
+        return
+    }
+    if not (r.code >= 200 and r.code < 300) {
+        ST.today_status = "HTTP " + _str(r.code)
+        note_result("查状态失败（HTTP " + _str(r.code) + "）")
+        refresh_today()
+        return
+    }
+    var active = core.dig(r.body, "active")
+    var checked = core.as_bool(core.dig(r.body, "today_checked_in"))
+    if active is bool => b {
+        if not b {
+            ST.today_status = "非签到季"
+        } else if checked {
+            ST.today_status = "已签到"
+        } else {
+            ST.today_status = "未签到"
+        }
+    } else {
+        ST.today_status = if checked then "已签到" else "未签到"
+    }
+    var streak = core.dig(r.body, "streak_days")
+    if streak != null { ST.streak = core.fmt_credit(streak) }
+    var total = core.dig(r.body, "total_credits")
+    if total != null { ST.total = core.fmt_credit(total) }
+    // 能量在成长中心（单独一个接口）；失败不影响上面已拿到的东西
+    var e = core.get_json(cl, c.endpoint + "/v2/activity/growth/energy")
+    if e.code >= 200 and e.code < 300 {
+        var bal = core.dig(e.body, "balance")
+        if bal != null { ST.energy = core.fmt_credit(bal) }
+    }
+    var today_credit = core.dig(r.body, "today_credit")
+    var extra = ""
+    if today_credit != null { extra = "（今日 +" + core.fmt_credit(today_credit) + "）" }
+    note_result("查状态完成：" + ST.today_status + extra + "，连签 " + ST.streak + " 天，累计 " + ST.total)
+    refresh_today()
+}
+
+// 签到 + 成长中心（与 CLI 的 auto 同一条路）
+func do_signin() {
+    if NO_NET { note_result("离线模式：已跳过签到"); return }
+    var c = open_conn()
+    if not c.ok { return }
+    var cl = c.client
+    if cl == null { note_result("内部错误：连接已失效"); return }
+    STATUS_TEXT = "签到中…"
+    var a = checkin.run_auto(cl, c.endpoint)
+    ST.today_status = ""
+    var result = jsons.get_str(a.out, "result", "")
+    if result == "CLAIMED" { ST.today_status = "已签到" }
+    if result == "ALREADY" { ST.today_status = "已签到" }
+    if result == "INACTIVE" { ST.today_status = "非签到季" }
+    if result == "NETWORK" or result == "TIMEOUT" { ST.today_status = "网络不可达" }
+    if result == "" { ST.today_status = "未知" }
+    var report = jsons.get_str(a.out, "report", "")
+    var today = auto.now_parts()[0]
+    if ST.today_status == "已签到" { ST.signed_date = today }
+    // 签到响应里本身就带连签/累计 ⇒ 顺手填上，不必为"显示好看"再打一次查询接口
+    var sd = core.dig(a.out, "streak_days")
+    if sd != null { ST.streak = core.fmt_credit(sd) }
+    var tc = core.dig(a.out, "total_credits")
+    if tc != null { ST.total = core.fmt_credit(tc) }
+    refresh_today()
+    if err_like(result) {
+        note_result(report)
+        return
+    }
+    // 签到没大问题就顺手跑成长中心（与 CLI 的 auto 一致）
+    var g = growth.run_growth(cl, c.endpoint)
+    var greport = jsons.get_str(g, "report", "")
+    var credits = core.as_int(core.dig(g, "credits_gained"), 0)
+    var gcode = core.as_int(core.dig(g, "_code"), 0)
+    var text = report
+    if credits != 0 or gcode != 0 { text = text + "；" + greport }
+    var np = auto.now_parts()
+    ST.last_poll_date = np[0]
+    ST.last_poll_min = auto.parse_hhmm(np[1])
+    note_result(text)
+}
+
+// 仅成长中心
+func do_growth() {
+    if NO_NET { note_result("离线模式：已跳过成长中心"); return }
+    var c = open_conn()
+    if not c.ok { return }
+    var cl = c.client
+    if cl == null { note_result("内部错误：连接已失效"); return }
+    STATUS_TEXT = "查成长中心…"
+    var g = growth.run_growth(cl, c.endpoint)
+    var np = auto.now_parts()
+    ST.last_poll_date = np[0]
+    ST.last_poll_min = auto.parse_hhmm(np[1])
+    note_result(jsons.get_str(g, "report", ""))
+}
+
+// 检查凭据（离线自检：不解密、不联网）
+func do_doctor() {
+    var c = open_conn()
+    if not c.ok { return }
+    var session = load_session_quiet(c.auth_path)
+    if session == null { note_result("登录凭据不可解析"); return }
+    var out = {}
+    try {
+        out = auth.doctor_report(session)
+    } catch e {
+        note_result("检查凭据失败：" + core.clip(_str(e.msg), 120))
+        return
+    }
+    note_result(jsons.get_str(out, "report", "") + "（" + jsons.get_str(out, "result", "") + "）")
+}
+
+func err_like(string result): bool {
+    if result == "NETWORK" or result == "TIMEOUT" { return true }
+    if result == "ERROR" or result == "UNKNOWN" { return true }
+    if result == "NO_SESSION" or result == "AUTH_ERROR" { return true }
+    if result == "AUTH_REJECTED" or result == "FORBIDDEN" { return true }
+    return false
+}
+
+func load_session_quiet(string path): Dict[string, any] {
+    var text = ""
+    try { text = auth.read_text(path) } catch e { return null }
+    var d = null
+    try { d = jsons.decode(text) } catch e { return null }
+    return d as Dict[string, any]
+}
+
+// ==================== 自动化每拍 ====================
+func sched_tick() {
+    if AUTO_SELFTEST { return }                        // 自检期间由自检脚本驱动，避免真去签到
+    var np = auto.now_parts()
+    var today = np[0]
+    var now_min = auto.parse_hhmm(np[1])
+    if auto.signin_due(CFG, ST, today, now_min) {
+        do_signin()
+    } else if auto.poll_due(CFG, ST, today, now_min) {
+        do_growth()
+    }
+    refresh_hints()
+}
+
+// ==================== 无头自检 ====================
+func sf_ck(bool cond, string what) {
+    if cond {
+        _sfPass = _sfPass + 1
+        print("[自检] OK   " + what + "\n")
+    } else {
+        _sfFail = _sfFail + 1
+        print("[自检] FAIL " + what + "\n")
+    }
+}
+
+func sf_run() {
+    print("[自检] 开始（离线=" + _str(NO_NET) + "）\n")
+    sf_ck(CFG.signin_at == "00:05", "默认配置：定时签到 00:05")
+    sf_ck(auto.parse_hhmm("23:59") == 1439, "时间解析 23:59")
+    sf_ck(auto.parse_hhmm("24:00") < 0, "非法时间 24:00 被拒")
+    sf_ck(auto.parse_hhmm("0:05") < 0, "非法时间 0:05 被拒")
+    do_status()
+    sf_ck(ST.today_status != "未知" or NO_NET, "查状态后今日状态不再是未知（" + ST.today_status + "）")
+    sf_ck(STATUS_TEXT != "就绪", "状态行已更新")
+    var before = ST.signed_date
+    CFG.signin_at = "00:00"
+    CFG.signin_on = true
+    ST.signed_date = ""
+    var np = auto.now_parts()
+    sf_ck(auto.signin_due(CFG, ST, np[0], auto.parse_hhmm(np[1])), "定时签到：设为 00:00 且今天未签 ⇒ 本拍应触发")
+    ST.signed_date = np[0]
+    sf_ck(not auto.signin_due(CFG, ST, np[0], auto.parse_hhmm(np[1])), "定时签到：今天已签 ⇒ 不再触发")
+    ST.signed_date = before
+    sf_ck(auto.poll_due(CFG, ST, np[0], auto.parse_hhmm(np[1])) or not CFG.poll_on, "轮询判定可用")
+    print("[自检] 通过 " + _str(_sfPass) + " / 失败 " + _str(_sfFail) + "\n")
+    _exit(if _sfFail > 0 then 1 else 0)
+}
+
+// ==================== 入口 ====================
+main() {
+    var autoFrames = _env_or("WORKBUDDY_GUI_AUTO", "")
+    if autoFrames != "" { AUTO_FRAMES = _int(autoFrames) }
+    AUTO_SELFTEST = _env("WORKBUDDY_GUI_SELFTEST") != null
+    NO_NET = _env("WORKBUDDY_GUI_NO_NET") != null
+    var startHidden = false
+    var argv = _args()
+    var ai = 0
+    while ai < argv.len() {
+        if _str(argv[ai]) == "--tray" { startHidden = true }
+        ai = ai + 1
+    }
+    // 自检/冒烟要看到打印 ⇒ 这两种模式**不**隐藏控制台
+    if AUTO_FRAMES == 0 and not AUTO_SELFTEST { _console(false) }
+
+    CFG = auto.load_cfg()
+    ST = auto.load_state()
+    if AUTO_SELFTEST {
+        // 自检不碰真实配置：用临时目录 + 临时自启项名
+        _env("WORKBUDDY_TRAY_SELFTEST", "1")
+        CFG = new AutoCfg()
+    }
+    refresh_today()
+    refresh_hints()
+
+    var win = SDL3.createWindow({title:"WorkBuddy 签到助手", w:660, h:620, resizable:false})
+    if not win.ok {
+        print("[gui] 窗口创建失败\n")
+        _exit(1)
+    }
+    SDL3.ttfInit()
+
+    // ---- 顶部：标题 + 状态徽标 ----
+    win.add(SDL3.createLabel({x:24, y:14, text:"WorkBuddy 签到助手", font_size:22, text_color:#DCE6FFFF}))
+    var badge = SDL3.createBadge({x:520, y:16, text:BADGE_TEXT, font_size:13.0, bg_color:#2A3242FF,
+                                  text_color:#C8D2E6FF, border_color:#505564FF})
+    win.add(badge)
+
+    // ---- 卡片 A：今日 ----
+    var cardA = win.addPanel({x:24, y:56, w:612, h:104, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
+    var todayLbl = SDL3.createLabel({x:44, y:74, text:TODAY_TEXT, font_size:17, text_color:#DCE6FFFF})
+    cardA.add(todayLbl)
+    var statsLbl = SDL3.createLabel({x:44, y:110, text:STATS_TEXT, font_size:14, text_color:#B4C8FFFF})
+    cardA.add(statsLbl)
+
+    // ---- 卡片 B：操作 ----
+    var cardB = win.addPanel({x:24, y:172, w:612, h:96, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
+    var btnSignin = SDL3.createButton({x:44, y:196, w:150, h:44, text:"立即签到", type:"primary",
+                                       font_size:15, tip:"签到 + 成长中心（幂等，重复点只是多查一次）"})
+    cardB.add(btnSignin)
+    var btnStatus = SDL3.createButton({x:206, y:196, w:130, h:44, text:"查状态", font_size:15,
+                                       tip:"只查询今日签到状态与连签/累计/能量"})
+    cardB.add(btnStatus)
+    var btnGrowth = SDL3.createButton({x:348, y:196, w:130, h:44, text:"领成长奖励", font_size:15,
+                                       tip:"只要成长中心：旅行礼物 / 任务奖 / 补登 / 连登兑换 / 盲盒"})
+    cardB.add(btnGrowth)
+    var btnDoctor = SDL3.createButton({x:490, y:196, w:126, h:44, text:"检查凭据", font_size:15,
+                                       tip:"离线自检：凭据格式 + 解密能力（不联网）"})
+    cardB.add(btnDoctor)
+
+    // ---- 卡片 C：自动化 ----
+    var cardC = win.addPanel({x:24, y:280, w:612, h:236, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
+    cardC.add(SDL3.createLabel({x:44, y:296, text:"自动化", font_size:15, text_color:#B4C8FFFF}))
+
+    var tglAuto = SDL3.createToggle({x:44, y:326, w:52, h:28, on:tray.autostart_on(), tip:"开机自动启动本程序（启动即只留托盘）"})
+    cardC.add(tglAuto)
+    cardC.add(SDL3.createLabel({x:108, y:331, text:"开机自启动", font_size:15, text_color:#DCE6FFFF}))
+
+    var tglSignin = SDL3.createToggle({x:44, y:366, w:52, h:28, on:CFG.signin_on, tip:"每天到点自动签到（程序在跑即生效）"})
+    cardC.add(tglSignin)
+    cardC.add(SDL3.createLabel({x:108, y:371, text:"定时签到", font_size:15, text_color:#DCE6FFFF}))
+    var edtTime = SDL3.createEdit({x:196, y:366, w:76, h:30, text:CFG.signin_at, font_size:15, tip:"每天几点（HH:MM，本地时间）"})
+    cardC.add(edtTime)
+
+    var tglPoll = SDL3.createToggle({x:300, y:366, w:52, h:28, on:CFG.poll_on, tip:"按间隔轮询成长中心（领旅行礼物/任务奖等）"})
+    cardC.add(tglPoll)
+    cardC.add(SDL3.createLabel({x:364, y:371, text:"轮询（分钟）", font_size:15, text_color:#DCE6FFFF}))
+    var edtPoll = SDL3.createEdit({x:478, y:366, w:70, h:30, text:_str(CFG.poll_minutes), font_size:15, tip:"间隔分钟数（≥5）"})
+    cardC.add(edtPoll)
+
+    var tglTray = SDL3.createToggle({x:44, y:412, w:52, h:28, on:CFG.close_to_tray, tip:"点关闭按钮时收进托盘而不是退出"})
+    cardC.add(tglTray)
+    cardC.add(SDL3.createLabel({x:108, y:417, text:"关窗收进托盘", font_size:15, text_color:#DCE6FFFF}))
+
+    var hintLbl = SDL3.createLabel({x:44, y:462, text:HINT_TEXT, font_size:13, text_color:#8A93A6FF})
+    cardC.add(hintLbl)
+
+    // ---- 底部状态行 ----
+    var statusLbl = SDL3.createLabel({x:24, y:532, text:STATUS_TEXT, font_size:14, text_color:#B4C8FFFF})
+    win.add(statusLbl)
+    var modeLbl = SDL3.createLabel({x:24, y:562, text:"凭据模式：" + auth.credential_mode()
+        + "　|　托盘：右键 = 菜单，左键 = 显示/隐藏", font_size:12, text_color:#7A8396FF})
+    win.add(modeLbl)
+
+    // ==================== 回调 ====================
+    btnSignin.on_click(func():void { do_signin(); refresh_hints() })
+    btnStatus.on_click(func():void { do_status(); refresh_hints() })
+    btnGrowth.on_click(func():void { do_growth(); refresh_hints() })
+    btnDoctor.on_click(func():void { do_doctor() })
+
+    tglAuto.on_change(func(bool on) {
+        if tray.set_autostart(on) {
+            note_result("开机自启动已" + (if on then "开启" else "关闭"))
+        } else {
+            note_result("开机自启动设置失败（自启项不可写或本平台未实现）")
+            tglAuto.set_on(not on)
+        }
+    })
+    tglSignin.on_change(func(bool on) {
+        CFG.signin_on = on
+        auto.save_cfg(CFG)
+        if not on { ST.signed_date = "" }        // 关掉再打开 ⇒ 允许当天再自动签一次
+        refresh_hints()
+        note_result("定时签到已" + (if on then "开启" else "关闭"))
+    })
+    tglPoll.on_change(func(bool on) {
+        CFG.poll_on = on
+        auto.save_cfg(CFG)
+        refresh_hints()
+        note_result("轮询成长中心已" + (if on then "开启" else "关闭"))
+    })
+    tglTray.on_change(func(bool on) {
+        CFG.close_to_tray = on
+        auto.save_cfg(CFG)
+        note_result("关窗行为已设为" + (if on then "收进托盘" else "退出"))
+    })
+    // 时间编辑框：**只在合法 HH:MM 时落盘**（非法只提示，不改配置 —— 免得把定时弄失效）
+    edtTime.on_change(func() {
+        var v = edtTime.get_text().trim()
+        if auto.parse_hhmm(v) < 0 {
+            note_result("时间格式要 HH:MM（如 08:30）—— 已保留原设置 " + CFG.signin_at)
+            return
+        }
+        CFG.signin_at = v
+        auto.save_cfg(CFG)
+        refresh_hints()
+        note_result("定时签到时间已设为 " + v)
+    })
+    edtPoll.on_change(func() {
+        var v = edtPoll.get_text().trim()
+        var n = _int(v)
+        if n < 5 or n > 1440 {
+            note_result("轮询间隔要在 5~1440 分钟之间 —— 已保留原设置 " + _str(CFG.poll_minutes))
+            return
+        }
+        CFG.poll_minutes = n
+        auto.save_cfg(CFG)
+        refresh_hints()
+        note_result("轮询间隔已设为 " + v + " 分钟")
+    })
+
+    // ---- 托盘（失败 ⇒ 退化为普通窗口：关窗即退出）----
+    var trayOk = false
+    if not AUTO_SELFTEST {
+        trayOk = tray.tray_init(win, func():void { do_signin(); refresh_hints() })
+        if startHidden and trayOk {
+            tray.tray_show(false)
+            print("[gui] --tray：启动即隐藏到托盘\n")
+        }
+    }
+    if trayOk {
+        var tipCache = ""
+        win.addTimer(150, func():void {
+            tray.tray_tick()
+            if tipCache != TODAY_TEXT {
+                tipCache = TODAY_TEXT
+                tray.tray_set_tip(TODAY_TEXT)
+            }
+        })
+    }
+    // 自动化拍子：1 秒一次判定（到点/到间隔才真的发请求）
+    win.addTimer(1000, func():void {
+        sched_tick()
+        refresh_today()
+    })
+    // 无头冒烟要**强制重绘**：win.run 是事件驱动重绘，空闲时不画 ⇒ 不放定时器帧数永远不前进
+    if AUTO_FRAMES > 0 { win.addTimer(50, func():void { }) }
+
+    if AUTO_SELFTEST {
+        win.addTimerOnce(400, func():void { sf_run() })
+    }
+    if not NO_NET and AUTO_FRAMES == 0 and not AUTO_SELFTEST {
+        do_status()                              // 启动先查一次，省得用户盯着"未知"
+    }
+
+    // ==================== 主循环 ====================
+    win.run(
+        func(Event ev): bool {
+            if ev.isQuit() { return false }
+            if ev.isWindowClose() {
+                if trayOk and CFG.close_to_tray {
+                    tray.tray_show(false)
+                    win.cancelClose()
+                    return true
+                }
+                return false
+            }
+            if ev.isKeyDown() and ev.scancode() == Scancode.ESCAPE { return false }
+            return true
+        },
+        func(Renderer r) {
+            r.clearColor(#12141AFF)
+            apply_view(todayLbl, statsLbl, statusLbl, hintLbl, badge)
+            FRAMES = FRAMES + 1
+            if FRAMES == 1 {
+                print("[gui] 首帧渲染 ok　" + TODAY_TEXT + "　" + STATUS_TEXT + "\n")
+            }
+            if AUTO_FRAMES > 0 and FRAMES >= AUTO_FRAMES {
+                print("[gui] frames=" + _str(FRAMES) + "  " + TODAY_TEXT + "  " + STATS_TEXT
+                      + "  状态=" + STATUS_TEXT + "\n")
+                _exit(if _sfFail > 0 then 1 else 0)
+            }
+        }
+    )
+    print("[gui] 主循环退出　frames=" + _str(FRAMES) + "　状态=" + STATUS_TEXT + "\n")
+    if trayOk { tray.tray_shutdown() }
+    SDL3.ttfQuit()
+}

@@ -1,0 +1,163 @@
+// wb_envelope.leno — 纯 Leno 解密 WorkBuddy 的 `sym-v1` 凭据信封（**不依赖 Node/JS**）
+//
+// 信封结构（客户端魔改 Electron 的 at-rest 加密，2026-10 实测）：
+//   auth.accessToken = { "$wbEncrypted": 1, "envelope": "<base64(JSON)>" }
+//   内层 JSON = { suite:1, keyId, nonce(b64,12B), authTag(b64,16B), ciphertext(b64) }
+//   密钥       = sha256( atRestSecretKey 这个**字符串**的 UTF-8 字节 )   ← 注意哈希的是字符串本身
+//   keyId      = sha256(密钥).hex 的前 16 个字符
+//   AAD        = WB-AAD\0 | 0x01 | lp('WBEV1') | lp('sym-v1') | 0,0,0,1 | lp(keyId) | 2,0,0
+//                其中 lp(s) = 4 字节大端长度 + UTF-8 字节
+//   算法       = AES-256-GCM（12 字节 nonce），标签 16 字节
+//
+// 这段逻辑原先只能交给客户端运行时里的一段 JS 做（`electron_browser_workbuddy_storage`
+// 那个原生绑定没有 Leno 侧的等价物）；现在密码学部分由 **LenoCrypto 的 AES-256-GCM** 承担，
+// 于是**只要拿到密钥**，解密全程都是纯 Leno ✓（密钥来源见 wb_auth.leno 的说明）。
+import jsons
+import strings
+import "Crypto" as crypto
+
+var TOKEN_LIMIT = 32768
+
+struct Envelope {
+    int suite = 0
+    string key_id = ""
+    Array[int] nonce = []
+    Array[int] tag = []
+    Array[int] ciphertext = []
+}
+
+// 4 字节大端长度 + 字节（AAD 里的分帧头）
+func lp_bytes(string s): string {
+    var n = s.byte_len()
+    return strings.char(_uint8(n >> 24)) + strings.char(_uint8(n >> 16))
+        + strings.char(_uint8(n >> 8)) + strings.char(_uint8(n)) + s
+}
+
+// 与客户端逐字节一致的 AAD
+export func build_aad(string key_id): Array[int] {
+    var s = "WB-AAD" + strings.char(0) + strings.char(1)
+        + lp_bytes("WBEV1") + lp_bytes("sym-v1")
+        + strings.char(0) + strings.char(0) + strings.char(0) + strings.char(1)
+        + lp_bytes(key_id)
+        + strings.char(2) + strings.char(0) + strings.char(0)
+    return strings.to_bytes(s)
+}
+
+// keyId 口径：sha256(密钥) 的十六进制前 16 字符
+export func key_id_of(Array[int] key32): string {
+    return crypto.bytes_to_hex(crypto.sha256_bytes(key32)).slice(0, 15)
+}
+
+// 由密钥字符串（atRestSecretKey）派生 AES-256 密钥
+export func derive_key(string secret): Array[int] {
+    return crypto.sha256_bytes(strings.to_bytes(secret))
+}
+
+func is_hex16(string s): bool {
+    if s.len() != 16 { return false }
+    for 0:15 to i {
+        var b = s.byte(i)
+        var ok = b >= 48 and b <= 57
+        if b >= 97 and b <= 102 { ok = true }
+        if not ok { return false }
+    }
+    return true
+}
+
+// 解内层信封（已 base64 解码后的 JSON），字段严格校验 —— 不认识的形状一律报错，
+// 绝不"猜着解"（解错密钥只会得到认证失败，不如早报清楚）
+export func parse_envelope(string json_text): Envelope {
+    var obj = null
+    try { obj = jsons.decode(json_text) } catch e { throw "INVALID_FORMAT" }
+    var d = obj as Dict[string, any]
+    if d == null { throw "INVALID_FORMAT" }
+    if d.keys().len() != 5 { throw "INVALID_FORMAT" }
+    for ["suite", "keyId", "nonce", "authTag", "ciphertext"] to need {
+        if not d.has(need) { throw "INVALID_FORMAT" }
+    }
+    var suite = -1
+    var suite_any = d.get("suite")
+    if suite_any is int => si { suite = si }
+    if suite < 0 { throw "INVALID_FORMAT" }
+    var key_id = jsons.get_str(d, "keyId", "")
+    if not is_hex16(key_id) { throw "INVALID_FORMAT" }
+    var nonce = decode_b64(d, "nonce")
+    if nonce.len() != 12 { throw "INVALID_FORMAT" }
+    var tag = decode_b64(d, "authTag")
+    if tag.len() != 16 { throw "INVALID_FORMAT" }
+    var ct = decode_b64(d, "ciphertext")
+    if ct.len() == 0 { throw "INVALID_FORMAT" }
+    return new Envelope(suite = suite, key_id = key_id, nonce = nonce, tag = tag, ciphertext = ct)
+}
+
+// base64 字段 → 字节；解不开就是格式问题（与"认证失败"必须分开，前者要用户更新脚本、后者要查密钥）
+func decode_b64(Dict[string, any] d, string field): Array[int] {
+    var text = jsons.get_str(d, field, "")
+    if text == "" { throw "INVALID_FORMAT" }
+    try {
+        return strings.to_bytes(strings.from_base64(text))
+    } catch e {
+        throw "INVALID_FORMAT"
+    }
+}
+
+// token 字符集/长度（与客户端 JS 助手同口径）
+export func valid_token(string t): bool {
+    var n = t.byte_len()
+    if n <= 0 or n > TOKEN_LIMIT { return false }
+    for 0:n - 1 to i {
+        var b = t.byte(i)
+        var ok = b >= 48 and b <= 57
+        if b >= 65 and b <= 90 { ok = true }
+        if b >= 97 and b <= 122 { ok = true }
+        if b == 46 or b == 95 or b == 126 { ok = true }
+        if b == 43 or b == 47 or b == 45 or b == 61 { ok = true }
+        if not ok { return false }
+    }
+    return true
+}
+
+// 带 `$wbEncrypted` 信封的值（客户端旧版的明文 token 不在这里处理）
+export func is_envelope(any v): bool {
+    var d = v as Dict[string, any]
+    if d == null { return false }
+    if d.len() != 2 { return false }
+    if not d.has("$wbEncrypted") { return false }
+    if not d.has("envelope") { return false }
+    var flag = d.get("$wbEncrypted")
+    if not (flag is int) { return false }
+    return true
+}
+
+// 主入口：密钥字符串 + `$wbEncrypted` 值 ⇒ 明文 token（纯 Leno，不启任何子进程）
+export func decrypt_sym_v1(string secret, any value): string {
+    var d = value as Dict[string, any]
+    if d == null { throw "UNSUPPORTED_ENVELOPE" }
+    var flag = d.get("$wbEncrypted")
+    var ok_flag = false
+    if flag is int => fi { if fi == 1 { ok_flag = true } }
+    if not ok_flag { throw "UNSUPPORTED_ENVELOPE" }
+    var outer = jsons.get_str(d, "envelope", "")
+    if outer == "" { throw "INVALID_FORMAT" }
+    var inner = ""
+    try {
+        inner = strings.from_base64(outer)
+    } catch e {
+        throw "INVALID_FORMAT"
+    }
+    var env = parse_envelope(inner)
+    if env.suite != 1 { throw "UNSUPPORTED_ENVELOPE" }
+    var key = derive_key(secret)
+    // keyId 对不上说明这份凭据与这把密钥不是一对 ⇒ 明确报 KEY_MISMATCH（别让它变成含糊的认证失败）
+    if key_id_of(key) != env.key_id { throw "KEY_MISMATCH" }
+    var plain = []
+    try {
+        plain = crypto.gcm_open_parts(key, env.nonce, build_aad(env.key_id), env.ciphertext, env.tag)
+    } catch e {
+        // 标签不符：密钥对得上但数据被改过（或 AAD 口径变了）⇒ 归 DECRYPT_FAILED，不是脚本错误
+        throw "DECRYPT_FAILED"
+    }
+    var token = strings.from_bytes(plain)
+    if not valid_token(token) { throw "INVALID_FORMAT" }
+    return token
+}

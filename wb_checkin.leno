@@ -1,0 +1,179 @@
+// wb_checkin.leno — 签到本身：查状态 → 未签才领 → 重新取状态 → 汇报
+//
+// 幂等是**设计前提**，不是巧合：
+//   · 先查状态，说已签就**不**提交（重复提交只会在服务端白跑一趟）；
+//   · 领取接口本身也幂等（当天重复领取返回"已签"而不会再发一次积分），所以两个签到
+//     接口都允许重试 —— 而成长中心里的写操作（抽奖/领奖/补登）**一律不重试**。
+//
+// 结果码：CLAIMED / ALREADY / INACTIVE / NETWORK / TIMEOUT / UNKNOWN /
+// ERROR / AUTH_REJECTED / FORBIDDEN。
+import jsons
+import strings
+import "wb_core.leno" as core
+import "wb_auth.leno" as auth
+use core.(HttpClient, ApiResp)
+
+var STATUS_PATH = "/v2/billing/meter/checkin-activity-status"
+var CLAIM_PATH = "/v2/billing/meter/daily-checkin"
+
+struct RunOut {
+    int code = 0
+    Dict[string, any] out = {}
+}
+
+func ok_code(int c): bool { return c >= 200 and c < 300 }
+
+func first_non_null(any a, any b): any {
+    if a != null { return a }
+    return b
+}
+
+// "今日已签"汇报：只把**确实拿到**的字段写进文案
+export func already_report(Dict[string, any] status, string via): Dict[string, any] {
+    var today_credit = first_non_null(core.dig(status, "today_credit"), core.dig(status, "daily_credit"))
+    var streak_days = core.dig(status, "streak_days")
+    var total_credits = core.dig(status, "total_credits")
+    var is_streak_day = core.dig(status, "is_streak_day")
+    var next_streak_day = core.dig(status, "next_streak_day")
+    var inner = []
+    if today_credit != null { inner.add("今日 +" + core.fmt_credit(today_credit)) }
+    if streak_days != null { inner.add("连续 " + core.fmt_credit(streak_days) + " 天") }
+    if total_credits != null { inner.add("累计 " + core.fmt_credit(total_credits) + " 积分") }
+    var prefix = via
+    if prefix == "" { prefix = "今日已签过" }
+    var report = prefix
+    if inner.len() > 0 { report = prefix + "（" + strings.join(inner, "，") + "）" }
+    return {
+        "result": "ALREADY",
+        "report": report,
+        "today_credit": today_credit,
+        "streak_days": streak_days,
+        "total_credits": total_credits,
+        "is_streak_day": is_streak_day,
+        "next_streak_day": next_streak_day
+    }
+}
+
+// 领取接口返回是否表示"今日已签"（兼容 null 正文与 HTTP 400 + code 10001）
+export func is_already_checked_in(Dict[string, any] body): bool {
+    var raw = jsons.get_str(body, "raw", "")
+    if raw != "" and raw.trim() == "null" { return true }        // 正文就是 null ⇒ 服务端语义 = 已签
+    var code = core.dig(body, "code")
+    if core.as_int(code, -1) == 10001 { return true }
+    var msg = jsons.get_str(body, "msg", "")
+    if msg.has("已签") { return true }
+    return false
+}
+
+// 查签到状态（只读 ⇒ 允许重试）
+export func fetch_status(HttpClient c, string endpoint): ApiResp {
+    return core.post(c, endpoint + STATUS_PATH, "", true)
+}
+
+// 领取今日积分（幂等 ⇒ 允许重试）
+func claim_credit(HttpClient c, string endpoint): ApiResp {
+    return core.post(c, endpoint + CLAIM_PATH, "", true)
+}
+
+// 每日自动化主逻辑：查状态 → 未签才领 → 一行汇报
+export func run_auto(HttpClient c, string endpoint): RunOut {
+    var r = fetch_status(c, endpoint)
+    if r.code == core.CODE_BUDGET_OUT {
+        return new RunOut(code = 1, out = {"result": "TIMEOUT",
+            "report": "已达本次运行时间预算，签到跳过，下次自动重试"})
+    }
+    if r.code == core.CODE_NO_NETWORK {
+        var err = jsons.get_str(r.body, "error", "")
+        return new RunOut(code = 1, out = {"result": "NETWORK",
+            "report": "网络不可达，签到跳过，下次自动重试" + part_in_parens(err), "error": err})
+    }
+    if core.is_auth_code(r.code) {
+        return new RunOut(code = 1, out = auth.http_auth_failure(r.code))
+    }
+    if not ok_code(r.code) {
+        return new RunOut(code = 1, out = {"result": "ERROR", "http": r.code,
+            "report": "签到接口返回异常（HTTP " + _str(r.code) + "），请重新登录客户端或稍后重试",
+            "status_body": r.body})
+    }
+
+    var status = r.body
+    var active = core.dig(status, "active")
+    var inactive = false
+    if active is bool => b { if not b { inactive = true } }
+    if inactive {
+        // ⚠ activity_name 藏在 data 信封里 ⇒ 必须走 dig（直接 get_str 取顶层会恒为空）
+        var activity_name = core.fmt_credit(core.dig(status, "activity_name"))
+        var rep = "签到活动未开启"
+        if activity_name != "" and activity_name != "null" { rep = rep + "（" + activity_name + "）" }
+        return new RunOut(code = 0, out = {"result": "INACTIVE", "report": rep, "active": false})
+    }
+    if core.as_bool(core.dig(status, "today_checked_in")) {
+        return new RunOut(code = 0, out = already_report(status, ""))
+    }
+
+    var cl = claim_credit(c, endpoint)
+    if cl.code == core.CODE_NO_NETWORK or cl.code == core.CODE_BUDGET_OUT {
+        var result = "NETWORK"
+        if cl.code == core.CODE_BUDGET_OUT { result = "TIMEOUT" }
+        return new RunOut(code = 1, out = {"result": result,
+            "report": "领取请求未能送达，下次自动重试" + part_in_parens(jsons.get_str(cl.body, "error", ""))})
+    }
+    // 认证或权限拒绝先于"已签"判断
+    if core.is_auth_code(cl.code) {
+        return new RunOut(code = 1, out = auth.http_auth_failure(cl.code))
+    }
+
+    if is_already_checked_in(cl.body) {
+        var fresh = refresh_or(status, c, endpoint)
+        return new RunOut(code = 0, out = already_report(fresh, "今日已签过（服务端判定已领取）"))
+    }
+
+    var credit = core.dig(cl.body, "credit")
+    if credit != null {
+        var fresh2 = refresh_or(status, c, endpoint)
+        var streak_days = first_non_null(core.dig(fresh2, "streak_days"), core.dig(status, "streak_days"))
+        var total_credits = core.dig(fresh2, "total_credits")
+        var is_streak_day = core.dig(fresh2, "is_streak_day")
+        var next_streak_day = core.dig(fresh2, "next_streak_day")
+        var bonus = ""
+        if core.as_bool(is_streak_day) { bonus = "，且为连签奖励日" }
+        var cum = ""
+        if total_credits != null { cum = "，累计 " + core.fmt_credit(total_credits) + " 积分" }
+        // streak_days 缺失时不要把 null 打进文案
+        var streak = ""
+        if streak_days != null {
+            streak = "（连续 " + core.fmt_credit(streak_days) + " 天" + cum + "）"
+        } else if cum != "" {
+            streak = "（" + cum.slice(1, cum.len() - 1) + "）"
+        }
+        var report = "成功领取 " + core.fmt_credit(credit) + " 积分" + bonus + streak
+        return new RunOut(code = 0, out = {
+            "result": "CLAIMED", "report": report, "credit": credit,
+            "streak_days": streak_days, "total_credits": total_credits,
+            "is_streak_day": is_streak_day, "next_streak_day": next_streak_day})
+    }
+
+    if cl.body.has("code") or cl.body.has("msg") {
+        var msg = jsons.get_str(cl.body, "msg", "")
+        if msg == "" { msg = "code " + core.fmt_credit(core.dig(cl.body, "code")) }
+        return new RunOut(code = 1, out = {"result": "ERROR", "http": cl.code,
+            "report": "领取失败：" + msg + "（HTTP " + _str(cl.code) + "）", "claim_body": cl.body})
+    }
+
+    var shown = ""
+    try { shown = core.clip(jsons.encode(cl.body), 200) } catch e { shown = "?" }
+    return new RunOut(code = 1, out = {"result": "UNKNOWN", "http": cl.code,
+        "report": "未识别的领取返回，请检查接口：" + shown, "claim_body": cl.body})
+}
+
+// 领取后重新查一次状态（拿最新连签/累计）。失败 ⇒ 用旧状态兜底，绝不因此把"领到了"说成失败
+func refresh_or(Dict[string, any] fallback, HttpClient c, string endpoint): Dict[string, any] {
+    var r = fetch_status(c, endpoint)
+    if ok_code(r.code) { return r.body }
+    return fallback
+}
+
+func part_in_parens(string detail): string {
+    if detail == "" { return "" }
+    return "（" + detail + "）"
+}

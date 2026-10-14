@@ -1,0 +1,250 @@
+// test/test_wb_units.leno — 纯函数离线自测（不联网、不起子进程）
+//
+// 覆盖的都是"写错了也不会立刻报错、但会在某天静默失效"的那一类判断：
+// 预算夹取、token 字符集、信封识别、状态/领取的判据、补登日历选点、ETA 换算。
+import jsons
+import strings
+import files
+import dirs
+import "..\\wb_core.leno" as core
+import "..\\wb_auth.leno" as auth
+import "..\\wb_checkin.leno" as checkin
+import "..\\wb_growth.leno" as growth
+
+var passed = 0
+var failed = 0
+
+func check(string name, bool got, bool want) {
+    if got == want {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name + "：期望 " + _str(want) + "，实际 " + _str(got))
+    }
+}
+
+func check_s(string name, string got, string want) {
+    if got == want {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name + "：期望「" + want + "」，实际「" + got + "」")
+    }
+}
+
+func check_i(string name, int got, int want) {
+    if got == want {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name + "：期望 " + _str(want) + "，实际 " + _str(got))
+    }
+}
+
+func section(string name) { print("== " + name) }
+
+// ==================== core：标量转换 ====================
+func test_core() {
+    section("core 标量转换")
+    check_i("as_int 数字", core.as_int(100, 0), 100)
+    check_i("as_int 浮点截断", core.as_int(1.9, 0), 1)
+    check_i("as_int 数字串", core.as_int("42", 0), 42)
+    check_i("as_int 浮点串", core.as_int("1.5", 0), 1)
+    check_i("as_int 负整数串", core.as_int("-7", 0), -7)
+    check_i("as_int 非数字串回落", core.as_int("abc", 9), 9)
+    check_i("as_int 空串回落", core.as_int("", 9), 9)
+    check_i("as_int null 回落", core.as_int(null, 9), 9)
+    check_i("as_int bool true", core.as_int(true, 9), 1)
+    check_i("as_int 前缀数字不算数字（12x）", core.as_int("12x", 9), 9)
+    check("as_float 数字串", core.as_float("2.5", 0.0) == 2.5, true)
+    check_s("fmt_credit 整数", core.fmt_credit(100), "100")
+    check_s("fmt_credit 原样字符串", core.fmt_credit("A"), "A")
+    check_s("clip 截断", core.clip("abcdef", 3), "abc")
+    check("http_label 伪码", core.http_label(core.CODE_NO_NETWORK) == "网络不可达", true)
+    check("is_hard_failure 5xx", core.is_hard_failure(503), true)
+    check("is_hard_failure 4xx 不算", core.is_hard_failure(403), false)
+}
+
+// ==================== core：预算夹取 ====================
+func test_budget() {
+    section("core 时间预算")
+    var b = core.parse_budget(420.0, 540.0)
+    check("默认值", b.seconds == 420.0, true)
+    check_s("默认无告警", b.warning, "")
+    _env("WORKBUDDY_BUDGET_SECONDS", "abc")
+    var bad = core.parse_budget(420.0, 540.0)
+    check("非数字 ⇒ 回落默认", bad.seconds == 420.0, true)
+    check("非数字 ⇒ 有告警", bad.warning != "", true)
+    _env("WORKBUDDY_BUDGET_SECONDS", "0")
+    check("0 ⇒ 回落默认（不能夹成 0，否则每个请求都直接放弃）", core.parse_budget(420.0, 540.0).seconds == 420.0, true)
+    _env("WORKBUDDY_BUDGET_SECONDS", "-5")
+    check("-5 ⇒ 回落默认", core.parse_budget(420.0, 540.0).seconds == 420.0, true)
+    _env("WORKBUDDY_BUDGET_SECONDS", "9999")
+    check("超上限 ⇒ 夹到上限", core.parse_budget(420.0, 540.0).seconds == 540.0, true)
+    check("轮询上限更短", core.parse_budget(180.0, 240.0).seconds == 240.0, true)
+    _env("WORKBUDDY_BUDGET_SECONDS", "300")
+    check("合法值原样", core.parse_budget(420.0, 540.0).seconds == 300.0, true)
+    _env("WORKBUDDY_BUDGET_SECONDS", "")
+}
+
+// ==================== auth：token / 信封 / 登录态 ====================
+func test_auth() {
+    section("auth 凭据判据")
+    check("token 合法", auth.valid_token("abc.DEF-123_~+/="), true)
+    check("token 空串非法", auth.valid_token(""), false)
+    check("token 含空格非法", auth.valid_token("abc def"), false)
+    check("token 含中文非法", auth.valid_token("令牌"), false)
+
+    var plain = auth.token_kind("stub-token-abc123")
+    check_s("字符串 ⇒ plaintext", plain, "plaintext")
+    var env = auth.token_kind({"$wbEncrypted": 1, "envelope": "x"})
+    check_s("信封 ⇒ sym-v1", env, "sym-v1")
+    var bad_reason = "none"
+    try { auth.token_kind({"$wbEncrypted": 2, "envelope": "x"}) } catch e { bad_reason = _str(e.msg) }
+    check_s("$wbEncrypted 非 1 ⇒ UNSUPPORTED_ENVELOPE", bad_reason, "UNSUPPORTED_ENVELOPE")
+    bad_reason = "none"
+    try { auth.token_kind({"$wbEncrypted": 1, "envelope": "x", "extra": 1}) } catch e { bad_reason = _str(e.msg) }
+    check_s("多余字段 ⇒ UNSUPPORTED_ENVELOPE", bad_reason, "UNSUPPORTED_ENVELOPE")
+    bad_reason = "none"
+    try { auth.token_kind(123) } catch e { bad_reason = _str(e.msg) }
+    check_s("数字 ⇒ INVALID_FORMAT", bad_reason, "INVALID_FORMAT")
+
+    // 登录态
+    var ok_sess = {"auth": {"accessToken": "stub-token-abc123", "domain": "www.workbuddy.cn"},
+                   "account": {"uid": "1111"}}
+    check_s("完整登录态通过", auth.validate_session(ok_sess), "")
+    check_s("缺 account ⇒ MISSING_SESSION", auth.validate_session({"auth": {"accessToken": "x"}}), "MISSING_SESSION")
+    check_s("缺 accessToken ⇒ MISSING_SESSION", auth.validate_session({"auth": {}, "account": {"uid": "1"}}), "MISSING_SESSION")
+    check_s("accessToken 空串 ⇒ MISSING_SESSION",
+            auth.validate_session({"auth": {"accessToken": ""}, "account": {"uid": "1"}}), "MISSING_SESSION")
+    check_s("uid 空串 ⇒ MISSING_SESSION",
+            auth.validate_session({"auth": {"accessToken": "x"}, "account": {"uid": ""}}), "MISSING_SESSION")
+    check_s("domain 带空格 ⇒ INVALID_FORMAT",
+            auth.validate_session({"auth": {"accessToken": "x", "domain": "a b"}, "account": {"uid": "1"}}), "INVALID_FORMAT")
+    check_s("endpoint 非 https ⇒ INVALID_FORMAT",
+            auth.validate_session({"auth": {"accessToken": "x", "endpoint": "http://a.cn"}, "account": {"uid": "1"}}), "INVALID_FORMAT")
+    check_s("endpoint 带 query ⇒ INVALID_FORMAT",
+            auth.validate_session({"auth": {"accessToken": "x", "endpoint": "https://a.cn/?x=1"}, "account": {"uid": "1"}}), "INVALID_FORMAT")
+    check_s("endpoint 缺省 ⇒ 官方端点",
+            auth.endpoint_of({"auth": {}, "account": {}}), core.DEFAULT_ENDPOINT)
+    check_s("endpoint 去尾斜杠",
+            auth.endpoint_of({"auth": {"endpoint": "https://a.cn//"}, "account": {}}), "https://a.cn")
+
+    // 请求头
+    var headers = auth.build_headers(ok_sess, "stub-token-abc123")
+    var has_auth = false
+    var has_domain = false
+    for headers to h {
+        if strings.starts_with(h, "Authorization: Bearer ") { has_auth = true }
+        if h == "X-Domain: www.workbuddy.cn" { has_domain = true }
+    }
+    check("带 Authorization 头", has_auth, true)
+    check("带 X-Domain 头", has_domain, true)
+
+    // 原因码 → 结果码
+    check_s("MISSING_SESSION ⇒ NO_SESSION", jsons.get_str(auth.auth_failure("MISSING_SESSION"), "result", ""), "NO_SESSION")
+    check_s("其它 ⇒ AUTH_ERROR", jsons.get_str(auth.auth_failure("DECRYPT_FAILED"), "result", ""), "AUTH_ERROR")
+    check_s("401 ⇒ AUTH_REJECTED", jsons.get_str(auth.http_auth_failure(401), "result", ""), "AUTH_REJECTED")
+    check_s("403 ⇒ FORBIDDEN", jsons.get_str(auth.http_auth_failure(403), "result", ""), "FORBIDDEN")
+
+    // 凭据文件探测：环境变量指向不存在的文件时必须**单独报告**、不回退去猜别的路径
+    _env("WORKBUDDY_AUTH_FILE", "D:\\nope\\nope.info")
+    var found = auth.find_auth_file()
+    check_s("覆盖路径不存在 ⇒ 空路径", found[0], "")
+    check_i("候选清单只含覆盖路径", found.len(), 2)
+    _env("WORKBUDDY_AUTH_FILE", "")
+
+    // 真实形态的 fixture：加密信封也要能过登录态校验（否则会走到解密那一步才失败）
+    var env_fixture = dirs.join(dirs.join(dirs.script_dir(), "fixtures"), "session-envelope.json")
+    var env_session = jsons.decode(files.read(env_fixture)) as Dict[string, any]
+    var env_auth = env_session.get("auth") as Dict[string, any]
+    check_s("fixture 信封识别为 sym-v1", auth.token_kind(env_auth.get("accessToken")), "sym-v1")
+    check_s("fixture 登录态格式有效", auth.validate_session(env_session), "")
+}
+
+// ==================== checkin：已签判据 ====================
+func test_checkin() {
+    section("checkin 判据")
+    check("正文 null ⇒ 已签", checkin.is_already_checked_in({"raw": "null"}), true)
+    check("code 10001 ⇒ 已签", checkin.is_already_checked_in({"code": 10001}), true)
+    check("msg 含已签 ⇒ 已签", checkin.is_already_checked_in({"code": 400, "msg": "今天已签到，请明天再来"}), true)
+    check("有 credit ⇒ 未签", checkin.is_already_checked_in({"code": 0, "data": {"credit": 100}}), false)
+
+    var rep = checkin.already_report({"data": {"today_credit": 100, "streak_days": 7, "total_credits": 700}}, "")
+    check_s("已签文案", jsons.get_str(rep, "report", ""), "今日已签过（今日 +100，连续 7 天，累计 700 积分）")
+    check_s("已签结果码", jsons.get_str(rep, "result", ""), "ALREADY")
+    var rep2 = checkin.already_report({"data": {"today_credit": 100}}, "今日已签过（服务端判定已领取）")
+    check_s("已签文案只有一项", jsons.get_str(rep2, "report", ""), "今日已签过（服务端判定已领取）（今日 +100）")
+    var rep3 = checkin.already_report({"data": {}}, "")
+    check_s("无字段时只说已签过", jsons.get_str(rep3, "report", ""), "今日已签过")
+}
+
+// ==================== growth：纯逻辑 ====================
+func test_growth() {
+    section("growth 判据")
+    check("没有次数 ⇒ 常态", growth.is_no_chance("insufficient lottery chance balance"), true)
+    check("not enough chances ⇒ 常态", growth.is_no_chance("Not enough chance balance"), true)
+    check("no chance ⇒ 常态", growth.is_no_chance("no chance to draw"), true)
+    check("参数错误 ⇒ 不是常态", growth.is_no_chance("invalid request"), false)
+    check("未知档位 400 ⇒ 可换写法重试",
+          growth.is_unknown_tier(400, {"msg": "unknown tier"}), true)
+    check("未知档位但非 400 ⇒ 不重试",
+          growth.is_unknown_tier(500, {"msg": "unknown tier"}), false)
+    check("invalid request ⇒ 不重试（业务拒绝不代表参数格式错）",
+          growth.is_unknown_tier(400, {"msg": "invalid request"}), false)
+    check("档位未解锁 403 ⇒ 常态", growth.is_tier_locked(403, {"msg": "连续登录天数不足"}), true)
+    check("其它 403 ⇒ 不是档位未解锁", growth.is_tier_locked(403, {"msg": "forbidden"}), false)
+
+    section("growth 补登日历选点")
+    var streak = {"streak": {"days": 7, "makeup_dates": ["2026-10-11"]}, "launch_date": "2026-06-17"}
+    var heat = {"today": {"date": "2026-10-14"}, "cells": [
+        {"date": "2026-10-13", "score": 100},
+        {"date": "2026-10-12", "score": 0},
+        {"date": "2026-10-11", "score": 0},
+        {"date": "2026-10-14", "score": 0},
+        {"date": "2026-09-30", "score": 0}]}
+    var dates = growth.makeup_candidates(streak, heat)
+    // 10-14 是今天（不补）、10-11 已在 makeup_dates（已补过）、09-30 是上个月（不在当月窗口）
+    check_i("只剩一个可补日期", dates.len(), 1)
+    check_s("最近断点优先", dates[0], "2026-10-12")
+
+    // 结构异常必须整段停下，绝不"靠猜测消耗补登卡"
+    var thrown = "none"
+    try { growth.makeup_candidates(streak, {"today": {"date": "2026-10-14"}}) } catch e { thrown = "1" }
+    check_s("缺 cells ⇒ 抛错停止", thrown, "1")
+    thrown = "none"
+    try { growth.makeup_candidates(streak, {"cells": []}) } catch e { thrown = "1" }
+    check_s("缺服务端日期 ⇒ 抛错停止", thrown, "1")
+    thrown = "none"
+    try { growth.makeup_candidates(streak, {"today": {"date": "2026-10-14"}, "cells": [{"date": "bad", "score": 0}]}) } catch e { thrown = "1" }
+    check_s("日期格式非法 ⇒ 抛错停止", thrown, "1")
+    thrown = "none"
+    try { growth.makeup_candidates(streak, {"today": {"date": "2026-10-14"}, "cells": [{"date": "2026-10-12", "score": -1}]}) } catch e { thrown = "1" }
+    check_s("分数为负 ⇒ 抛错停止", thrown, "1")
+    // 已补登的日期不能被当成待办（10-12 已补 ⇒ 只剩 10-11）
+    var streak2 = {"streak": {"days": 7, "makeup_dates": ["2026-10-12"]}, "launch_date": "2026-06-17"}
+    var dates2 = growth.makeup_candidates(streak2, heat)
+    check_i("已补登的日期要排除", dates2.len(), 1)
+    check_s("排除后取下一个断点", dates2[0], "2026-10-11")
+
+    section("growth ETA 换算")
+    check_s("已到达", growth.fmt_eta(100, 200), "，已到达待领取")
+    check_s("分钟级", growth.fmt_eta(200 + 600, 200), "，约 10 分钟后回")
+    check_s("59 分钟仍是分钟级", growth.fmt_eta(200 + 3540, 200), "，约 59 分钟后回")
+    // 3599s **不**说成"约 60 分钟"：四舍五入到 60 分钟后直接切小时量纲
+    check_s("3599 秒切到小时量纲", growth.fmt_eta(200 + 3599, 200), "，约 1.0 小时后回")
+    check_s("小时级", growth.fmt_eta(200 + 7200, 200), "，约 2.0 小时后回")
+    check_s("缺失时间戳 ⇒ 空串", growth.fmt_eta(null, 200), "")
+}
+
+main() {
+    test_core()
+    test_budget()
+    test_auth()
+    test_checkin()
+    test_growth()
+    print("")
+    print("通过 " + _str(passed) + " / 失败 " + _str(failed))
+    if failed > 0 { _exit(1) }
+    _exit(0)
+}

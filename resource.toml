@@ -1,0 +1,18 @@
+# resource.toml — 打包资源配置（独立于 leno.toml，没有 leno.toml 也能用）
+#
+# [pack] 控制 -p 打包：
+#   onefile   = true  → 单文件模式：库与资源内嵌进 exe，首次运行解包到**用户缓存目录**
+#                       （按资源内容哈希分子目录；不会污染 exe 所在目录/桌面）
+#   resources = 通配模式数组（相对本文件所在目录，声明什么就嵌什么）
+#
+# 本应用随包资源只有 `images/`：wb_tray.leno 经 dirs.res_dir() 读托盘图标与菜单图标
+#   （未打包时 res_dir() == 脚本所在目录；打包后是解包目录 ⇒ 两种模式同一份代码，不需要分支 ✓）。
+# 凭据助手**不是**资源：它内嵌在 wb_auth.leno 的原始字符串里（见那里的说明），
+#   运行时以环境变量 + `-e` 交给客户端，全程不落盘 ⇒ 少一处"打包没带上"的失败面 ✓。
+#
+# 控制台：GUI 的 main() 里有 `_console(false)`（打包时会自动选无控制台版 VM）；
+#   命令行 `-p --no-console` / `-p --console` 仍可显式覆盖 ✓。
+
+[pack]
+onefile   = true
+resources = ["images/**"]

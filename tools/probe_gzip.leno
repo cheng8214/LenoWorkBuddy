@@ -1,0 +1,46 @@
+// 探针：验证 LenoWeb 的 web_gzip 能解真实文件形态 "base64(gzip(text))"
+// —— 客户端 local_storage/*.info 就是这个形态，也是我此前误判"Leno 没有 gzip"的那一处。
+//
+// 用法：leno tools\probe_gzip.leno <file.b64> [expected.txt]
+//   第二个参数给了原文文件时，顺带做逐字节一致性比对。
+//
+// 为什么走**文件**而不是环境变量：含换行/非 ASCII 的值经 _env 传给子进程会失真（本项目实测过），
+// 而这条路本来就是"从磁盘读一个 base64 文本"，走文件才是真实用法。
+import files
+import strings
+import "web_gzip" as gz
+
+main() {
+    var args = _args()
+    if args.len() == 0 {
+        print("用法: probe_gzip <file.b64> [expected.txt]")
+        _exit(2)
+    }
+    var path = args[0]
+    if not files.exists(path) {
+        print("找不到文件: " + path)
+        _exit(2)
+    }
+    var b64 = files.read(path).trim()
+    print("① base64 文本 " + _str(b64.len()) + " 字符, 魔数识别=" + _str(gz.isGzip(b64.from_base64())))
+
+    var raw = b64.from_base64()
+    // ⚠ 二进制串上 len() 是**字符数**、byte_len() 才是字节数（本探针第一版就踩了：146 字节报成 127）
+    print("② base64 解码后 byte_len=" + _str(strings.byte_len(raw)) + " len=" + _str(raw.len()))
+
+    var r = gz.gunzip(raw)
+    print("③ gunzip ok=" + _str(r.ok) + " in=" + _str(r.inBytes) + " out=" + _str(r.outBytes) + " err=" + r.error)
+    if not r.ok { _exit(1) }
+
+    if args.len() > 1 {
+        var want = files.read(args[1])
+        var verdict = "不一致"
+        if r.data == want { verdict = "逐字节一致" }
+        print("④ 与原文比对: " + verdict + "（原文 " + _str(want.len()) + " 字节）")
+    }
+
+    // take(start, n)：按**字符个数**取（slice 是闭区间，容易差一位；纯展示用 take 更省心）
+    var head = r.data.take(0, 100)
+    print("⑤ 解出内容头部: " + head)
+    _exit(0)
+}

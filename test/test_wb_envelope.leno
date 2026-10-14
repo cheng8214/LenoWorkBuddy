@@ -1,0 +1,117 @@
+// test/test_wb_envelope.leno — 纯 Leno 解密 sym-v1 信封的回归
+//
+// 向量与 LenoCrypto 的 WorkBuddy 形态用例同源（node:crypto 生成）：
+//   secret = "c2VjcmV0LVdvcmtCdWRkeS0zMi1ieXRlLWtleS1mb3ItdGVzdA=="（仅测试用）
+//   keyId  = 01bd4aaa144fbaa1，nonce 12 字节，AAD = WB-AAD 布局，明文 275 字节
+// ⇒ 这里验证的是**应用侧拼装**（信封解析 / 密钥派生 / AAD / 标签校验 / token 形状）
+import jsons
+import strings
+import "..\\wb_envelope.leno" as env
+
+var passed = 0
+var failed = 0
+
+func ok(string name, bool got) {
+    if got {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name)
+    }
+}
+
+func eq_s(string name, string got, string want) {
+    if got == want {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name + "：期望「" + want + "」，实际「" + got + "」")
+    }
+}
+
+// 期望解出的明文（275 字节的假 JWT，与 node 侧同一构造）
+func expected_payload(): string {
+    var xs = "x"
+    return "eyJhbGciOiJIUzI1NiJ9." + xs.rep(250) + ".sig"
+}
+
+func fixture(): Dict[string, any] {
+    var inner = {
+        "suite": 1,
+        "keyId": "01bd4aaa144fbaa1",
+        "nonce": strings.to_base64(strings.from_bytes(
+            hex_to_arr("466367574f6559624337516f"))),
+        "authTag": strings.to_base64(strings.from_bytes(
+            hex_to_arr("e9d5c26004c56578ef8e37474d2dfc8b"))),
+        "ciphertext": strings.to_base64(strings.from_bytes(hex_to_arr(
+            "b5b06b3e10c0d19f68f1bee6d138e80834e5be9eaf3ea9573462c18ef99509cb45a9eaba3967ad12905a299100d4fc89b9a7e4fc0cc31a0fc7781a0997dff7f12c8d5d901eb392cd6e36f5e52e214f3e9673c1f6e8780738fdb69f239c2342c2d6fcea3174b8521f35b52c3910c6b6c97727edd81334e2671b1687b80099762a0dfd74625c1d834011c6a4d978a192d63277bfc8a4d6084b8f40dab21e41e8c0e99ac3a6a2c0c3592137fa37b9e5d581b81de043108e028c88d5d468d3be52b080fd07db0e28545eabf4ab72b2ea7e575db5699dc8d122912e20cfa6c06f0a167afd74b8d89231356c44e779b0493e1799b1a13d57ddf1712664ca66ed68c7b69e46644e027d42eaa4a1ef4940e8c3961966b6")))
+    }
+    return {"$wbEncrypted": 1, "envelope": strings.to_base64(jsons.encode(inner))}
+}
+
+// hex → 字节数组（测内联，避免依赖 crypto 门面）
+func hex_to_arr(string hex): Array[int] {
+    var out = []
+    var digits = "0123456789abcdef"
+    var i = 0
+    while i < hex.byte_len() {
+        var hi = digits.find(hex.slice(i, i))
+        var lo = digits.find(hex.slice(i + 1, i + 1))
+        out.add(hi * 16 + lo)
+        i = i + 2
+    }
+    return out
+}
+
+main() {
+    var fx = fixture()
+    var secret = "c2VjcmV0LVdvcmtCdWRkeS0zMi1ieXRlLWtleS1mb3ItdGVzdA=="
+    ok("信封识别", env.is_envelope(fx))
+
+    // 明文 token 的值（非信封）不该走这条路径
+    ok("明文 token 不是信封", not env.is_envelope("stub-token-abc123"))
+
+    // 密钥派生与 keyId 口径
+    eq_s("keyId = sha256(key) 前 16 位", env.key_id_of(env.derive_key(secret)), "01bd4aaa144fbaa1")
+    // AAD 布局（与 node 生成的字节序逐字节一致）
+    eq_s("AAD 字节序", strings.to_hex(strings.from_bytes(env.build_aad("01bd4aaa144fbaa1"))),
+        "57422d41414400010000000557424556310000000673796d2d7631000000010000001030316264346161613134346662616131020000")
+
+    // 正解：解出 275 字节的假 JWT
+    var token = env.decrypt_sym_v1(secret, fx)
+    eq_s("解出明文", token, expected_payload())
+
+    // 错密钥 ⇒ KEY_MISMATCH（不是含糊的认证失败）
+    var reason = "none"
+    try { env.decrypt_sym_v1("wrong-secret-value", fx) } catch e { reason = _str(e.msg) }
+    eq_s("错密钥报 KEY_MISMATCH", reason, "KEY_MISMATCH")
+
+    // 篡改标签 ⇒ 认证失败（AEAD 不交付明文）
+    var inner = jsons.decode(strings.from_base64(jsons.get_str(fx, "envelope", ""))) as Dict[string, any]
+    var tampered = {
+        "suite": 1,
+        "keyId": jsons.get_str(inner, "keyId", ""),
+        "nonce": jsons.get_str(inner, "nonce", ""),
+        // 末位 hex 由 b 改成 0 ⇒ 标签不同（不改长度，专测 tag 校验本身）
+        "authTag": strings.to_base64(strings.from_bytes(hex_to_arr("e9d5c26004c56578ef8e37474d2dfc8" + "0"))),
+        "ciphertext": jsons.get_str(inner, "ciphertext", "")
+    }
+    var fake = {"$wbEncrypted": 1,
+                "envelope": strings.to_base64(jsons.encode(tampered))}
+    reason = "none"
+    try { env.decrypt_sym_v1(secret, fake) } catch e { reason = _str(e.msg) }
+    ok("篡改标签被拒（抛错）", reason != "none")
+
+    // 形状非法 ⇒ 明确报错
+    reason = "none"
+    try { env.decrypt_sym_v1(secret, {"$wbEncrypted": 2, "envelope": "x"}) } catch e { reason = _str(e.msg) }
+    eq_s("$wbEncrypted 非 1 ⇒ UNSUPPORTED_ENVELOPE", reason, "UNSUPPORTED_ENVELOPE")
+    reason = "none"
+    try { env.parse_envelope("{\"suite\":1}") } catch e { reason = _str(e.msg) }
+    eq_s("字段不全 ⇒ INVALID_FORMAT", reason, "INVALID_FORMAT")
+
+    print("")
+    print("通过 " + _str(passed) + " / 失败 " + _str(failed))
+    if failed > 0 { _exit(1) }
+    _exit(0)
+}

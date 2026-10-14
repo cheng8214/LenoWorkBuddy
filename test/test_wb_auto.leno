@@ -1,0 +1,139 @@
+// test/test_wb_auto.leno — 进程内调度与配置/状态落盘的离线回归
+//
+// 盯的都是"写错了当天就不会自动签到，而且看不出原因"的那类判断：
+// 时间解析口径、跨天重置、间隔下限、坏配置文件不能把程序带崩、配置回环。
+import strings
+import files
+import dirs
+import "..\\wb_auto.leno" as auto
+
+var passed = 0
+var failed = 0
+
+func ck(string name, bool got) {
+    if got {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name)
+    }
+}
+
+func eq_i(string name, int got, int want) {
+    if got == want {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name + "：期望 " + _str(want) + "，实际 " + _str(got))
+    }
+}
+
+func eq_s(string name, string got, string want) {
+    if got == want {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name + "：期望「" + want + "」，实际「" + got + "」")
+    }
+}
+
+main() {
+    _env("WORKBUDDY_DATA_DIR", dirs.join(_tmpdir(), "wb_auto_test"))
+    // 每次从干净状态开始（配置与状态都在这个临时目录里）
+    var root = _env_or("WORKBUDDY_DATA_DIR", "")
+    if files.exists(dirs.join(root, "wb_gui.json")) { files.delete(dirs.join(root, "wb_gui.json")) }
+    if files.exists(dirs.join(root, "wb_state.json")) { files.delete(dirs.join(root, "wb_state.json")) }
+
+    // ==================== 时间 ====================
+    eq_i("00:00", auto.parse_hhmm("00:00"), 0)
+    eq_i("00:05", auto.parse_hhmm("00:05"), 5)
+    eq_i("08:30", auto.parse_hhmm("08:30"), 510)
+    eq_i("23:59", auto.parse_hhmm("23:59"), 1439)
+    eq_i("24:00 非法", auto.parse_hhmm("24:00"), -1)
+    eq_i("12:60 非法", auto.parse_hhmm("12:60"), -1)
+    eq_i("0:05 非法（必须两位）", auto.parse_hhmm("0:05"), -1)
+    eq_i("12-05 非法", auto.parse_hhmm("12-05"), -1)
+    eq_i("空串非法", auto.parse_hhmm(""), -1)
+    eq_s("fmt_minutes 510", auto.fmt_minutes(510), "08:30")
+    eq_s("fmt_minutes 5", auto.fmt_minutes(5), "00:05")
+    eq_s("fmt_minutes 1439", auto.fmt_minutes(1439), "23:59")
+
+    // ==================== 调度判定 ====================
+    var c = auto.default_cfg()
+    var st = new auto.AutoState()
+    c.signin_at = "08:30"
+    c.signin_on = true
+    // 未到点 / 到点 / 今天已签 / 总开关关
+    ck("07:00 未到点不触发", not auto.signin_due(c, st, "2026-10-14", 420))
+    ck("08:30 到点触发", auto.signin_due(c, st, "2026-10-14", 510))
+    st.signed_date = "2026-10-14"
+    ck("今天已签不再触发", not auto.signin_due(c, st, "2026-10-14", 600))
+    ck("跨天重置后再次触发", auto.signin_due(c, st, "2026-10-15", 510))
+    c.signin_on = false
+    ck("总开关关着不触发", not auto.signin_due(c, st, "2026-10-15", 600))
+
+    // 轮询：跨天必触发；同一天按间隔
+    c.signin_on = true
+    c.poll_on = true
+    c.poll_minutes = 120
+    st.last_poll_date = "2026-10-14"
+    st.last_poll_min = 100
+    ck("间隔未到不轮询", not auto.poll_due(c, st, "2026-10-14", 200))
+    ck("间隔到了轮询", auto.poll_due(c, st, "2026-10-14", 220))
+    ck("跨天必轮询", auto.poll_due(c, st, "2026-10-15", 1))
+    c.poll_minutes = 0
+    st.last_poll_min = 200
+    ck("间隔下限 5 分钟（写 0 不许变成打接口）", not auto.poll_due(c, st, "2026-10-14", 203))
+    ck("超过下限即轮询", auto.poll_due(c, st, "2026-10-14", 206))
+    c.poll_on = false
+    ck("轮询总开关关着不触发", not auto.poll_due(c, st, "2026-10-15", 600))
+
+    // 提示文案（底部状态行与托盘提示共用）
+    c.poll_minutes = 120
+    c.signin_at = "08:30"
+    st.signed_date = ""
+    var hint = auto.signin_hint(c, st, "2026-10-14", 420)
+    ck("提示含「下次今天 08:30」", hint.has("下次今天 08:30"))
+    st.signed_date = "2026-10-14"
+    ck("已签提示含「已完成」", auto.signin_hint(c, st, "2026-10-14", 420).has("已完成"))
+
+    // ==================== 配置回环 ====================
+    c.poll_on = true                     // 上面为测"总开关关着"把它关掉了，这里复原
+    c.signin_at = "07:15"
+    c.poll_minutes = 45
+    c.close_to_tray = false
+    ck("保存配置成功", auto.save_cfg(c))
+    var c2 = auto.load_cfg()
+    eq_s("时间回环", c2.signin_at, "07:15")
+    eq_i("间隔回环", c2.poll_minutes, 45)
+    ck("关窗行为回环", not c2.close_to_tray)
+    ck("开关回环", c2.signin_on and c2.poll_on)
+
+    // 坏配置**不能**把程序带崩，也不许被静默改写成默认值（下次保存才覆盖）
+    files.write(dirs.join(_env_or("WORKBUDDY_DATA_DIR", ""), "wb_gui.json"), "{ 这不是 JSON")
+    var c3 = auto.load_cfg()
+    eq_s("坏配置回落默认时间", c3.signin_at, "00:05")
+    files.write(dirs.join(_env_or("WORKBUDDY_DATA_DIR", ""), "wb_gui.json"),
+        "{\"signin_at\":\"99:99\",\"poll_minutes\":-3}")
+    var c4 = auto.load_cfg()
+    eq_s("非法时间字段回落默认", c4.signin_at, "00:05")
+    eq_i("非法间隔回落默认", c4.poll_minutes, 120)
+
+    // ==================== 状态落盘 ====================
+    var s = new auto.AutoState()
+    s.signed_date = "2026-10-14"
+    s.last_poll_min = 123
+    s.today_status = "已签到"
+    s.streak = "12"
+    ck("保存状态成功", auto.save_state(s))
+    var s2 = auto.load_state()
+    eq_s("状态回环 日期", s2.signed_date, "2026-10-14")
+    eq_s("状态回环 今日", s2.today_status, "已签到")
+    eq_i("状态回环 分钟", s2.last_poll_min, 123)
+    eq_s("状态回环 连签", s2.streak, "12")
+
+    print("")
+    print("通过 " + _str(passed) + " / 失败 " + _str(failed))
+    if failed > 0 { _exit(1) }
+    _exit(0)
+}

@@ -1,0 +1,221 @@
+// test/test_wb_flow.leno — 端到端离线回归（真 HTTP、本地 stub、不碰真接口）
+//
+// 为什么要它：签到"未签→领取"这条路径**一天只能碰一次真接口**，而
+// 401 / 5xx 重试 / "服务端判已签" / "非签到季" / "正文为 null" 这些分支平时根本撞不上，
+// 偏偏它们最容易写错 ⇒ 让 Leno 自己起一个 stub 服务端，把整条链路跑穿。
+//
+// 运行：leno test\test_wb_flow.leno
+import jsons
+import strings
+import files
+import dirs
+import times
+import sockets
+import "..\\wb_core.leno" as core
+import "..\\wb_auth.leno" as auth
+import "..\\wb_checkin.leno" as checkin
+import "..\\wb_growth.leno" as growth
+use core.(HttpClient)
+
+var passed = 0
+var failed = 0
+var leno_exe = ""
+var stub_path = ""
+var fixture_path = ""
+
+func ok(string name, bool got) {
+    if got {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name)
+    }
+}
+
+func eq_i(string name, int got, int want) {
+    if got == want {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name + "：期望 " + _str(want) + "，实际 " + _str(got))
+    }
+}
+
+func eq_s(string name, string got, string want) {
+    if got == want {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name + "：期望「" + want + "」，实际「" + got + "」")
+    }
+}
+
+func has_text(string name, string haystack, string needle) {
+    if haystack.has(needle) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name + "：报告里找不到「" + needle + "」\n    实际：「" + haystack + "」")
+    }
+}
+
+// 起一个 stub 进程（独立端口 ⇒ 各场景互不干扰，也避开 TIME_WAIT）
+func start_stub(string mode, int port): int {
+    _env("WB_STUB_MODE", mode)
+    return _spawn(leno_exe, "\"" + stub_path + "\" " + _str(port))
+}
+
+func endpoint(int port): string {
+    return "http://127.0.0.1:" + _str(port)
+}
+
+func new_authed(Dict[string, any] session, string token, int port): HttpClient {
+    var c = core.new_client(20000)
+    c.replaceHeaders(auth.build_headers(session, token))
+    _env("WORKBUDDY_API_BASE", endpoint(port))
+    return c
+}
+
+main() {
+    leno_exe = _executable()
+    stub_path = dirs.join(dirs.script_dir(), "wb_stub.leno")
+    fixture_path = dirs.join(dirs.join(dirs.script_dir(), "fixtures"), "session.json")
+
+    // ---------- 凭据侧（不起 stub 的部分）----------
+    _env("WORKBUDDY_AUTH_FILE", fixture_path)
+    var found = auth.find_auth_file()
+    eq_s("按环境变量定位凭据", found[0], fixture_path)
+    var session = jsons.decode(auth.read_text(fixture_path)) as Dict[string, any]
+    ok("fixture 是合法登录态", session != null)
+    var token = auth.resolve_token(session, fixture_path)     // 明文 token ⇒ 不起子进程
+    eq_s("明文 token 直接可用", token, "stub-token-abc123")
+    var headers = auth.build_headers(session, token)
+    ok("请求头非空", headers.len() > 0)
+
+    // ---------- ① 正常一轮：未签 → 领取 → 再跑一次应判已签 ----------
+    _env("WORKBUDDY_BUDGET_SECONDS", "60")
+    core.start_budget("auto")
+    var h = start_stub("normal", 8801)
+    sleep(600)
+    var c = new_authed(session, token, 8801)
+    var a = checkin.run_auto(c, endpoint(8801))
+    eq_i("① 退出码", a.code, 0)
+    eq_s("① 结果码", jsons.get_str(a.out, "result", ""), "CLAIMED")
+    eq_i("① 实得积分", core.as_int(core.dig(a.out, "credit"), 0), 100)
+    eq_i("① 连签天数", core.as_int(core.dig(a.out, "streak_days"), 0), 7)
+    eq_i("① 累计积分", core.as_int(core.dig(a.out, "total_credits"), 0), 700)
+    eq_s("① 汇报文案", jsons.get_str(a.out, "report", ""), "成功领取 100 积分（连续 7 天，累计 700 积分）")
+
+    var g = growth.run_growth(c, endpoint(8801))
+    var rep = jsons.get_str(g, "report", "")
+    has_text("② 成长中心：派 Buddy", rep, "派 Buddy 去咖啡馆（2 小时后回）")
+    has_text("② 成长中心：接单", rep, "领取任务「试用 Hy4」（进度开始计）")
+    has_text("② 成长中心：领任务奖", rep, "领任务奖「写一句提示词」+credit10+energy1")
+    has_text("② 成长中心：补登", rep, "补登 2026-10-12（剩 0 张卡）")
+    has_text("② 成长中心：盲盒", rep, "开盲盒获得：2 积分")
+    has_text("② 成长中心：Buddy 盲盒", rep, "开 Buddy 盲盒 ×1（小北）")
+    has_text("② 成长中心：展示值", rep, "（能量 42，连签 7 天，本次 +共 10 积分）")
+    ok("② 成长中心非空跑", not core.as_bool(core.dig(g, "idle")))
+    eq_i("② 本次成长积分", core.as_int(core.dig(g, "credits_gained"), 0), 10)
+    eq_i("② 能量", core.as_int(core.dig(g, "energy"), 0), 42)
+    eq_i("② 连签", core.as_int(core.dig(g, "streak_days"), 0), 7)
+    eq_i("② 无硬失败", core.as_int(core.dig(g, "_code"), 0), 0)
+
+    var again = checkin.run_auto(c, endpoint(8801))
+    eq_s("③ 第二次运行判已签（幂等）", jsons.get_str(again.out, "result", ""), "ALREADY")
+    eq_i("③ 第二次退出码", again.code, 0)
+    _kill(h)
+
+    // ---------- ④ 服务端说今天已签 ----------
+    core.start_budget("auto")
+    var h4 = start_stub("already", 8804)
+    sleep(600)
+    var c4 = new_authed(session, token, 8804)
+    var a4 = checkin.run_auto(c4, endpoint(8804))
+    eq_s("④ 已签", jsons.get_str(a4.out, "result", ""), "ALREADY")
+    has_text("④ 已签文案", jsons.get_str(a4.out, "report", ""), "今日已签过（今日 +100，连续 7 天，累计 700 积分）")
+    _kill(h4)
+
+    // ---------- ⑤ 非签到季 ----------
+    core.start_budget("auto")
+    var h5 = start_stub("inactive", 8805)
+    sleep(600)
+    var c5 = new_authed(session, token, 8805)
+    var a5 = checkin.run_auto(c5, endpoint(8805))
+    eq_s("⑤ 非签到季", jsons.get_str(a5.out, "result", ""), "INACTIVE")
+    has_text("⑤ 非签到季文案", jsons.get_str(a5.out, "report", ""), "签到活动未开启（Buddy应用）")
+    eq_i("⑤ 非签到季不算失败", a5.code, 0)
+    _kill(h5)
+
+    // ---------- ⑥ 领取返回 400 + code 10001（幂等形态之一）----------
+    core.start_budget("auto")
+    var h6 = start_stub("claim400", 8806)
+    sleep(600)
+    var c6 = new_authed(session, token, 8806)
+    var a6 = checkin.run_auto(c6, endpoint(8806))
+    eq_s("⑥ 400+10001 按已签处理", jsons.get_str(a6.out, "result", ""), "ALREADY")
+    eq_i("⑥ 不算失败", a6.code, 0)
+    _kill(h6)
+
+    // ---------- ⑦ 领取正文是 null（另一种幂等形态）----------
+    core.start_budget("auto")
+    var h7 = start_stub("null_body", 8807)
+    sleep(600)
+    var c7 = new_authed(session, token, 8807)
+    var a7 = checkin.run_auto(c7, endpoint(8807))
+    eq_s("⑦ null 正文按已签处理", jsons.get_str(a7.out, "result", ""), "ALREADY")
+    _kill(h7)
+
+    // ---------- ⑧ 401：凭据被拒 ----------
+    core.start_budget("auto")
+    var h8 = start_stub("unauthorized", 8808)
+    sleep(600)
+    var c8 = new_authed(session, token, 8808)
+    var a8 = checkin.run_auto(c8, endpoint(8808))
+    eq_s("⑧ 401", jsons.get_str(a8.out, "result", ""), "AUTH_REJECTED")
+    eq_i("⑧ 401 退出码", a8.code, 1)
+    ok("⑧ 401 需要关注", core.as_bool(core.dig(a8.out, "needs_attention")))
+    _kill(h8)
+
+    // ---------- ⑨ 服务端抖动一次：按短促节奏重试后照样成功 ----------
+    core.start_budget("auto")
+    var h9 = start_stub("flaky", 8809)
+    sleep(600)
+    var c9 = new_authed(session, token, 8809)
+    var a9 = checkin.run_auto(c9, endpoint(8809))
+    eq_s("⑨ 抖动后仍签到成功", jsons.get_str(a9.out, "result", ""), "CLAIMED")
+    _kill(h9)
+
+    // ---------- ⑩ 服务端持续 5xx：预算不够就别重试，如实报 ERROR ----------
+    //    预算夹到 20 秒 ⇒ 一轮重试（3s + 30s 超时）都放不下 ⇒ 立刻返回，绝不跑穿任务时限
+    _env("WORKBUDDY_BUDGET_SECONDS", "20")
+    core.start_budget("auto")
+    var h10 = start_stub("server_error", 8810)
+    sleep(600)
+    var c10 = new_authed(session, token, 8810)
+    var a10 = checkin.run_auto(c10, endpoint(8810))
+    eq_s("⑩ 5xx 如实报错", jsons.get_str(a10.out, "result", ""), "ERROR")
+    has_text("⑩ 5xx 文案", jsons.get_str(a10.out, "report", ""), "HTTP 500")
+    eq_i("⑩ 5xx 退出码", a10.code, 1)
+    _kill(h10)
+
+    // ---------- ⑪ 连不上（端口没人听）：NETWORK，且不在低预算下死等重试 ----------
+    _env("WORKBUDDY_BUDGET_SECONDS", "20")
+    core.start_budget("auto")
+    var c11 = core.new_client(20000)
+    c11.replaceHeaders(auth.build_headers(session, token))
+    _env("WORKBUDDY_API_BASE", endpoint(8899))
+    var started = times.ms()
+    var a11 = checkin.run_auto(c11, endpoint(8899))
+    var cost = times.ms() - started
+    eq_s("⑪ 网络不可达", jsons.get_str(a11.out, "result", ""), "NETWORK")
+    ok("⑪ 低预算下不空等重试（< 10s）", cost < 10000.0)
+
+    _env("WORKBUDDY_API_BASE", "")
+    _env("WORKBUDDY_BUDGET_SECONDS", "")
+    _env("WORKBUDDY_AUTH_FILE", "")
+    print("")
+    print("通过 " + _str(passed) + " / 失败 " + _str(failed))
+    if failed > 0 { _exit(1) }
+    _exit(0)
+}

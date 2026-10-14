@@ -1,0 +1,757 @@
+// wb_growth.leno — 成长中心：领旅行礼物 / 派 Buddy / 任务接单与领奖 / 补登 / 连登兑换 /
+//                  开盲盒 / 能量开 Buddy / 展示值
+//
+// 三条口径（实战教训，改动前先读这段）：
+//   ① **写操作一律不重试**（抽奖/领奖/补登/兑换）。超时发生在"服务端已经处理完"之后，
+//      重试就是重复提交；只有两个签到接口例外（状态只读、领取幂等）。
+//   ② 各子步骤**各自 try**，一段失败不影响其余领取；但**认证/权限拒绝要立刻结束本轮**
+//      （拿同一个无效凭据继续打剩下的接口没有任何意义）。
+//   ③ "常态"不记为失败：旅行名额已用完、日期无需补登、连登档位未解锁、没有抽奖次数 ——
+//      这些都是服务端规则，若计进 failures，轮询会每轮强制落盘、把有价值的记录淹没。
+import jsons
+import strings
+import rands
+import "wb_core.leno" as core
+import "wb_auth.leno" as auth
+use core.(HttpClient, ApiResp)
+
+var GROWTH_PATH = "/v2/activity/growth"
+var MAKEUP_MAX_PER_RUN = 1
+var TASK_BATCH = 20
+// 连登兑换三档：(档位标识, /redeem/summary 里的状态字段前缀, 展示名, 天数)
+// tier 的口径是**档位标识字符串**：实测传 "starter"/"7"/7 分别得到 unknown tier /
+// unknown tier / invalid request，只有 "7d" 会兑换成功（权威来源是 GET /streak 的
+// redemption_status.tiers[].tier，状态字段仍读 /redeem/summary）。
+var REDEEM_TIERS = ["7d", "starter", "入门", "7", "14d", "advanced", "进阶", "14",
+                    "28d", "legendary", "巅峰", "28"]
+// 连登兑换各档奖励的官方文案（挖不到服务端实发字段时才回落）
+var REDEEM_FALLBACK = {"7d": "+2 能量 +1 补登卡 +1 次抽奖",
+                       "14d": "+50 积分 +3 能量 +1 补登卡 +1 次抽奖",
+                       "28d": "+150 积分 +5 能量 +1 补登卡 +1 次抽奖"}
+
+// 一次成长中心运行的**共享状态**（Leno 的 struct 实例是引用语义 ⇒ 各步骤函数回写同一份）
+struct Growth {
+    Array[string] parts = []
+    int credits = 0          // 本次实得积分（按服务端响应值累加）
+    int failures = 0         // 全部失败项，仅用于汇报
+    int hard_failures = 0    // 其中"需要关注"的，只有它们影响退出码
+    int successes = 0
+    // 展示值：**用原生数值**（对外 JSON 里 energy / streak_days 是数字，不是字符串）
+    int streak_days = 0
+    bool has_streak = false
+    int energy = 0
+    bool has_energy = false
+    string streak_raw = ""   // ③ 段取到的 /streak 原文（避免同一轮打两次同一接口）
+    string streak_date = ""  // /streak 是否已失效（补登成功会改变天数）
+    bool streak_stale = false
+    bool aborted = false
+    Dict[string, any] abort_out = {}
+}
+
+// ==================== 公共小工具 ====================
+func ok_code(int c): bool { return c >= 200 and c < 300 }
+
+func part_in_parens(string detail): string {
+    if detail == "" { return "" }
+    return "（" + detail + "）"
+}
+
+// 活动接口（抽奖/连登兑换）要求的防重放 token。官方前端用 `crypto.randomUUID()` 拼成 "u-<uuid>"，
+// 服务端只做幂等去重、不校验格式；**缺了它 /lottery/draw 直接 400**（实测过）。
+func client_token(): string {
+    return "u-" + rand_hex(8) + "-" + rand_hex(4) + "-" + rand_hex(4) + "-" + rand_hex(4) + "-" + rand_hex(12)
+}
+
+func rand_hex(int n): string {
+    var digits = "0123456789abcdef"
+    var out = ""
+    var i = 0
+    while i < n {
+        out = out + digits.slice(rands.ints(0, 15), rands.ints(0, 15))
+        i = i + 1
+    }
+    return out
+}
+
+// 挖不到响应里的实际数值时才用回落值（任务列表里的 reward_credit 是**活动配置**，
+// 与服务端这次实发可能不同；上报按响应值才不会虚报）
+func first_int(Dict[string, any] body, string key, any fallback): int {
+    var v = core.dig(body, key)
+    if v != null { return core.as_int(v, 0) }
+    return core.as_int(fallback, 0)
+}
+
+func body_msg(Dict[string, any] body): string {
+    var msg = jsons.get_str(body, "msg", "")
+    if msg == "" { msg = jsons.get_str(body, "error", "") }
+    return msg
+}
+
+// 把"时间戳差"换算成"还有多久回来"；任一时间戳缺失/非法就给空串
+// （纯展示信息，绝不能因为它让整轮执行失败）
+export func fmt_eta(any arrive_at, any server_now): string {
+    var left = core.as_float(arrive_at, 0.0) - core.as_float(server_now, 0.0)
+    if arrive_at == null or server_now == null { return "" }
+    if left != left { return "" }                     // NaN
+    if left > 1.0e17 or left < -1.0e17 { return "" }  // ±Inf
+    if left <= 0.0 { return "，已到达待领取" }
+    // 先算分钟再决定量纲：直接按 left < 3600 分档会让 3599s 显示成"约 60 分钟"
+    var minutes = _int(left / 60.0 + 0.5)
+    if minutes < 60 {
+        if minutes < 1 { minutes = 1 }
+        return "，约 " + _str(minutes) + " 分钟后回"
+    }
+    var tenths = _int(left / 360.0 + 0.5)             // 小时 × 10
+    return "，约 " + _str(tenths / 10) + "." + _str(tenths % 10) + " 小时后回"
+}
+
+// ==================== 失败/成功的统一记录 ====================
+// 已知业务 403 由调用方先处理，其余认证/权限拒绝结束本轮
+func check_auth(Growth g, int code): bool {
+    if code != 401 and code != 403 { return false }
+    g.aborted = true
+    g.abort_out = auth.http_auth_failure(code)
+    return true
+}
+
+func add_failure(Growth g, int code, string label, string detail) {
+    var reason = core.http_label(code)
+    var text = detail
+    if text == "" or text == reason { text = reason }
+    g.parts.add(label + "失败：" + reason + part_in_parens(text))
+    g.failures = g.failures + 1
+    if core.is_hard_failure(code) { g.hard_failures = g.hard_failures + 1 }
+}
+
+// 前置查询接口非 2xx 时的统一记录；返回 true = 调用方应跳过后续处理。
+// 硬失败（5xx / 网络不可达 / 预算耗尽）必须计入 failures：否则整轮 successes=0 且
+// failures=0 会被判成 idle，轮询既不写日志又返回 0，服务端故障彻底无声无息。
+// required=true 用于"不查就没法判断"的场景（连登状态/补登日历）：未知状态绝不能解释成"无需补登"。
+func note_http(Growth g, int code, Dict[string, any] body, string label, bool required): bool {
+    if ok_code(code) {
+        if not required { return false }
+        var biz = core.as_int(core.dig(body, "code"), 0)
+        if biz == 0 { return false }
+    }
+    add_failure(g, code, label, body_msg(body))
+    if required { g.hard_failures = g.hard_failures + 1; g.failures = g.failures + 1 }
+    return true
+}
+
+// ==================== ① Buddy 旅行：领礼物 + 派出发 ====================
+func step_travel(Growth g, HttpClient c, string base) {
+    var s = core.get_json(c, base + "/buddy/travel/status")
+    if s.code == core.CODE_BUDGET_OUT {
+        g.aborted = true
+        g.abort_out = {"result": "TIMEOUT", "report": "时间预算耗尽，成长中心跳过，下次自动重试"}
+        return
+    }
+    if s.code == core.CODE_NO_NETWORK {
+        // 网络不可达就立刻收手，别把后续 6 个接口的重试+等待全跑一遍
+        g.aborted = true
+        g.abort_out = {"result": "NETWORK",
+                       "report": "网络不可达，成长中心跳过" + part_in_parens(jsons.get_str(s.body, "error", ""))}
+        return
+    }
+    if check_auth(g, s.code) { return }
+    var travel = ""
+    var daily_limit = false
+    if ok_code(s.code) {
+        var st = core.dig(s.body, "state")
+        if st != null { travel = core.fmt_credit(st) }
+        daily_limit = core.as_bool(core.dig(s.body, "daily_limit_reached"))
+    }
+    var skip = note_http(g, s.code, s.body, "查旅行状态", false)
+    if skip { return }
+
+    if travel == "arrived" {
+        var record_id = core.dig(s.body, "record_id")
+        var payload = "{\"record_id\":" + json_number(record_id) + "}"
+        var c1 = core.post(c, base + "/buddy/travel/claim", payload, false)
+        if check_auth(g, c1.code) { return }
+        var reward = core.dig(c1.body, "reward_credit")
+        if ok_code(c1.code) and reward != null {
+            var got = core.as_int(reward, 0)
+            g.credits = g.credits + got
+            g.parts.add("领旅行礼物 +" + core.fmt_credit(got) + " 积分")
+            g.successes = g.successes + 1
+            travel = "idle"   // 只有领取成功后才视为 idle，允许派出发
+        } else {
+            // 领失败：带出业务 msg；也**不**派 Buddy 出发，避免覆盖未领取的奖励
+            add_failure(g, c1.code, "领旅行礼物", body_msg(c1.body))
+            return
+        }
+    }
+    if travel == "idle" and daily_limit {
+        // 今日名额已用完：直接收手，不碰 config/depart，省掉两个请求和一条必然的失败
+        g.parts.add("今日旅行名额已用完")
+    } else if travel == "idle" {
+        var cfg = core.get_json(c, base + "/buddy/travel/config")
+        if check_auth(g, cfg.code) { return }
+        var locs = core.dig(cfg.body, "locations")
+        if locs is Array => arr {
+            if arr.len() > 0 {
+                var loc = arr[0] as Dict[string, any]
+                if loc != null {
+                    var depart = core.post(c, base + "/buddy/travel/depart",
+                                           "{\"location_id\":" + json_number(loc.get("id")) + "}", false)
+                    if check_auth(g, depart.code) { return }
+                    if ok_code(depart.code) {
+                        var loc_name = "?"
+                        var loc_obj = core.dig(depart.body, "location") as Dict[string, any]
+                        if loc_obj != null { loc_name = jsons.get_str(loc_obj, "name", "?") }
+                        var dur = core.dig(depart.body, "duration_hours")
+                        if dur == null and loc_obj != null { dur = loc_obj.get("duration_hours") }
+                        g.parts.add("派 Buddy 去" + loc_name + "（" + core.fmt_credit(dur) + " 小时后回）")
+                        g.successes = g.successes + 1
+                    } else {
+                        add_failure(g, depart.code, "派 Buddy", body_msg(depart.body))
+                    }
+                }
+            }
+        }
+    } else if travel == "traveling" {
+        var loc_name2 = "?"
+        var loc_obj2 = core.dig(s.body, "location") as Dict[string, any]
+        if loc_obj2 != null { loc_name2 = jsons.get_str(loc_obj2, "name", "?") }
+        g.parts.add("Buddy 旅行中（" + loc_name2
+                    + fmt_eta(core.dig(s.body, "arrive_at"), core.dig(s.body, "server_now")) + "）")
+    }
+}
+
+// JSON 里塞一个数字/字符串：数字原样，字符串加引号（id 可能是 int 也可能是 string）
+func json_number(any v): string {
+    if v == null { return "null" }
+    if v is string => s {
+        var n = core.as_int(s, -1)
+        if _str(n) == s { return s }
+        return "\"" + s + "\""
+    }
+    var n2 = core.as_int(v, -1)
+    return _str(n2)
+}
+
+// ==================== ② 任务：接单 + 领奖 ====================
+// 真实契约（2026-09 从桌面端成长中心 H5 读出）：
+//   accept_status: not_accepted | accepted | in_progress | completed | claimed
+//   接单 POST /tasks/accept  body {"task_codes": [code, ...]}  ← **复数数组**
+//   领奖 POST /tasks/{task_code}/claim  ← 路径带 code、body 空
+func step_tasks(Growth g, HttpClient c, string base) {
+    var t = core.get_json(c, base + "/tasks")
+    if check_auth(g, t.code) { return }
+    if note_http(g, t.code, t.body, "查任务列表", false) { return }
+
+    var tasks = core.dig(t.body, "tasks")
+    if not (tasks is Array) { return }
+    var arr = tasks as Array
+    // 接单（分批，别把 body 撑大）
+    var pending = []
+    for arr to item {
+        var tk = item as Dict[string, any]
+        if tk == null { continue }
+        if core.as_bool(core.dig(tk, "locked")) { continue }
+        if jsons.get_str(tk, "accept_status", "") != "not_accepted" { continue }
+        var code = jsons.get_str(tk, "task_code", "")
+        if code != "" { pending.add(code) }
+    }
+    var i = 0
+    while i < pending.len() {
+        if core.budget_left() <= 0.0 {
+            g.parts.add("时间预算耗尽，剩余任务下次再接单")
+            break
+        }
+        var batch = []
+        var j = i
+        while j < pending.len() and j < i + TASK_BATCH {
+            batch.add(pending[j])
+            j = j + 1
+        }
+        i = i + TASK_BATCH
+        var a = core.post(c, base + "/tasks/accept", "{\"task_codes\":" + json_str_array(batch) + "}", false)
+        if check_auth(g, a.code) { return }
+        // 逐条读 results：接单失败必须报出来（常见 prerequisite not met: first_buddy），
+        // 静默吞掉的话接口坏了也没人知道 —— 轮询空跑是不写日志的
+        var results = core.dig(a.body, "results")
+        if results is Array => rows {
+            for rows to row {
+                var r = row as Dict[string, any]
+                if r == null { continue }
+                var tcode = jsons.get_str(r, "task_code", "")
+                var title = task_title(arr, tcode)
+                if jsons.get_str(r, "status", "") == "error" {
+                    var msg = jsons.get_str(r, "message", "")
+                    if msg == "" { msg = "HTTP " + _str(a.code) }
+                    g.parts.add("领取任务「" + title + "」失败：" + msg)
+                    g.failures = g.failures + 1
+                    if core.is_hard_failure(a.code) { g.hard_failures = g.hard_failures + 1 }
+                } else {
+                    g.parts.add("领取任务「" + title + "」（进度开始计）")
+                    g.successes = g.successes + 1
+                }
+            }
+        } else if ok_code(a.code) {
+            for batch to code2 {
+                g.parts.add("领取任务「" + task_title(arr, code2) + "」（进度开始计）")
+                g.successes = g.successes + 1
+            }
+        } else {
+            add_failure(g, a.code, "领取任务", body_msg(a.body))
+        }
+    }
+    // 领奖：只有 completed 才发奖，且走独立路径
+    for arr to item2 {
+        if core.budget_left() <= 0.0 {
+            g.parts.add("时间预算耗尽，剩余任务奖下次再领")
+            break
+        }
+        var tk2 = item2 as Dict[string, any]
+        if tk2 == null { continue }
+        if core.as_bool(core.dig(tk2, "locked")) { continue }
+        if jsons.get_str(tk2, "accept_status", "") != "completed" { continue }
+        var code3 = jsons.get_str(tk2, "task_code", "")
+        var title2 = task_title(arr, code3)
+        var cl = core.post(c, base + "/tasks/" + code3 + "/claim", "{}", false)
+        if check_auth(g, cl.code) { return }
+        if ok_code(cl.code) and not core.as_bool(core.dig(cl.body, "already_claimed")) {
+            // 优先用服务端实发数值；列表里的 reward_credit 只是活动配置
+            var rc = first_int(cl.body, "credit", tk2.get("reward_credit"))
+            var re = first_int(cl.body, "energy", tk2.get("reward_energy"))
+            g.credits = g.credits + rc
+            g.parts.add("领任务奖「" + title2 + "」+credit" + _str(rc) + "+energy" + _str(re))
+            g.successes = g.successes + 1
+        } else if ok_code(cl.code) {
+            g.parts.add("任务奖「" + title2 + "」已领过")
+        } else {
+            add_failure(g, cl.code, "领任务奖「" + title2 + "」", body_msg(cl.body))
+        }
+    }
+}
+
+func task_title(Array arr, string code): string {
+    for arr to item {
+        var tk = item as Dict[string, any]
+        if tk == null { continue }
+        if jsons.get_str(tk, "task_code", "") == code {
+            var t = jsons.get_str(tk, "title", "")
+            if t != "" { return t }
+        }
+    }
+    return code
+}
+
+func json_str_array(Array arr): string {
+    var out = "["
+    var i = 0
+    for arr to v {
+        if i > 0 { out = out + "," }
+        out = out + "\"" + core.fmt_credit(v) + "\""
+        i = i + 1
+    }
+    return out + "]"
+}
+
+// ==================== ③ 补登卡：断登自动补一张 ====================
+// 官方规则：补登卡上限 4 张、仅可补救当月断登。`/streak` 的 makeup_dates 是**已补登记录**，
+// 真正的断点来自 `/heatmap` 中 score == 0 的历史日期 —— 把前者当待办清单是旧版的 bug。
+// 放在连登兑换之前：补登会改变连登天数，先补，兑换才能拿到最新解锁状态。
+func step_makeup(Growth g, HttpClient c, string base) {
+    var m = core.get_json(c, base + "/streak")
+    if check_auth(g, m.code) { return }
+    if note_http(g, m.code, m.body, "查连登状态", true) { return }
+    g.streak_raw = ""
+    var cards_obj = core.dig(m.body, "makeup_cards")
+    var cards = 0
+    if cards_obj is Dict => cd { cards = core.as_int(core.dig(cd, "balance"), 0) }
+    else { cards = core.as_int(cards_obj, 0) }
+    if cards <= 0 { return }
+
+    var h = core.get_json(c, base + "/heatmap")
+    if check_auth(g, h.code) { return }
+    if note_http(g, h.code, h.body, "查补登日历", true) { return }
+    var dates = []
+    try {
+        dates = makeup_candidates(m.body, h.body)
+    } catch e {
+        g.parts.add("查补登日历失败：" + core.clip(_str(e.msg), 120))
+        g.failures = g.failures + 1
+        g.hard_failures = g.hard_failures + 1
+        return
+    }
+    if dates.len() == 0 { return }
+
+    var made_up = 0
+    var limit = cards
+    if limit > MAKEUP_MAX_PER_RUN { limit = MAKEUP_MAX_PER_RUN }
+    var i = 0
+    while i < dates.len() and i < limit {
+        if core.budget_left() <= 0.0 {
+            g.parts.add("时间预算耗尽，剩余补登下次再做")
+            break
+        }
+        var d = dates[i]
+        var u = core.post(c, base + "/makeup-cards/use", "{\"target_date\":\"" + d + "\"}", false)
+        if check_auth(g, u.code) { return }
+        if core_api_success(u.code, u.body) {
+            cards = cards - 1
+            made_up = made_up + 1
+            g.streak_stale = true
+            // 优先报服务端给的余额，本地递减只是接口没给时的兜底
+            var left_obj = core.dig(u.body, "makeup_cards")
+            var left_cards = cards
+            if left_obj is Dict => ld { left_cards = core.as_int(core.dig(ld, "balance"), cards) }
+            else if left_obj != null { left_cards = core.as_int(left_obj, cards) }
+            g.parts.add("补登 " + d + "（剩 " + _str(left_cards) + " 张卡）")
+            if left_cards < 0 { left_cards = 0 }
+            cards = left_cards
+            g.successes = g.successes + 1
+        } else {
+            var msg = body_msg(u.body)
+            if u.code == 400 and msg.trim().to_lower() == "date is not broken, no makeup needed" {
+                // 查询后被客户端或另一轮补上，是正常竞争：不再当作失败刷日志
+                g.parts.add(d + " 已活跃或已补登，无需再次补登")
+                break
+            }
+            add_failure(g, u.code, "补登 " + d, msg)
+            break
+        }
+        i = i + 1
+    }
+    if made_up > 0 and dates.len() > made_up and cards > 0 {
+        g.parts.add("另有 " + _str(dates.len() - made_up) + " 天可补、剩 " + _str(cards) + " 张卡，下轮继续")
+    }
+}
+
+// 补登相关接口同时检查 HTTP 状态和 JSON 业务码
+func core_api_success(int code, Dict[string, any] body): bool {
+    if not ok_code(code) { return false }
+    var biz = core.dig(body, "code")
+    if biz == null { return true }
+    return core.as_int(biz, -1) == 0
+}
+
+// 从日历选断登日期；makeup_dates 是"已补登历史"，不能作为待办清单。
+// 对齐官方成长中心：当月、今天之前、活动上线之后、score == 0。
+// 用 heatmap.today 的**服务端日期**，避免本机时区把月初/午夜算错；日历缺项不推测为零。
+export func makeup_candidates(Dict[string, any] streak_body, Dict[string, any] heatmap_body): Array[string] {
+    var today_obj = core.dig(heatmap_body, "today") as Dict[string, any]
+    if today_obj == null { throw "活跃日历缺少服务端日期" }
+    var today = iso_date(jsons.get_str(today_obj, "date", ""))
+    var launch = iso_date(core.fmt_credit(core.dig(streak_body, "launch_date")))
+    var start = today.slice(0, 7) + "-01"          // 当月 1 日（ISO 串比大小 == 比日期先后）
+    if launch > start { start = launch }
+    if "2026-06-17" > start { start = "2026-06-17" }
+    var streak = core.dig(streak_body, "streak") as Dict[string, any]
+    if streak == null { throw "连登状态格式无效" }
+    var made_list = streak.get("makeup_dates")
+    if not (made_list is Array) { throw "已补登记录格式无效" }
+    Array[string] made = []
+    for (made_list as Array) to v {
+        made.add(iso_date(core.fmt_credit(v)))
+    }
+    var cells = core.dig(heatmap_body, "cells")
+    if not (cells is Array) { throw "活跃日历缺少日期列表" }
+    var scores = {}
+    for (cells as Array) to cell {
+        var cd = cell as Dict[string, any]
+        if cd == null { throw "活跃日历记录格式无效" }
+        var day = iso_date(jsons.get_str(cd, "date", ""))
+        var score = cd.get("score")
+        var sv = core.as_float(score, -1.0)
+        if score == null or sv < 0.0 { throw "活跃日历分数无效" }
+        if scores.has(day) {
+            if core.as_float(scores.get(day), -1.0) != sv { throw "活跃日历同一日期的记录冲突" }
+        }
+        scores.set(day, sv)
+    }
+    // 最近的断点优先，以便尽早恢复当前连登；每轮仍受 MAKEUP_MAX_PER_RUN 限制
+    Array[string] out = []
+    var day_keys = scores.keys() as Array[string]
+    for day_keys to day2 {
+        if day2 < start { continue }
+        if day2 >= today { continue }
+        if core.as_float(scores.get(day2), -1.0) != 0.0 { continue }
+        if auth.in_list(made, day2) { continue }
+        out.add(day2)
+    }
+    out.sort()
+    out.reverse()
+    return out
+}
+
+// "YYYY-MM-DD" 格式校验（只做形状校验，值比较交给**字符串字典序** —— ISO 日期天然可用）
+func iso_date(string v): string {
+    var t = v.trim()
+    if t.len() != 10 { throw "日期格式无效" }
+    if t.byte(4) != 45 or t.byte(7) != 45 { throw "日期格式无效" }
+    var i = 0
+    while i < 10 {
+        if i != 4 and i != 7 {
+            var b = t.byte(i)
+            if b < 48 or b > 57 { throw "日期格式无效" }
+        }
+        i = i + 1
+    }
+    return t
+}
+
+// ==================== ④ 连登奖励兑换 ====================
+func step_redeem(Growth g, HttpClient c, string base) {
+    var r = core.get_json(c, base + "/redeem/summary")
+    if check_auth(g, r.code) { return }
+    if note_http(g, r.code, r.body, "查连登兑换", false) { return }
+    var i = 0
+    while i < REDEEM_TIERS.len() {
+        if core.budget_left() <= 0.0 {
+            g.parts.add("时间预算耗尽，剩余连登兑换下次再领")
+            break
+        }
+        var tier = REDEEM_TIERS[i]
+        var status_key = REDEEM_TIERS[i + 1]
+        var label = REDEEM_TIERS[i + 2]
+        var days = REDEEM_TIERS[i + 3]
+        i = i + 4
+        var status = core.dig(r.body, status_key + "_status")
+        // 字段缺失（null）同样跳过：接口改版时不该让脚本对三档无脑 POST
+        if status == null { continue }
+        var st = core.fmt_credit(status)
+        if st == "claimed" or st == "locked" { continue }
+        var payload = "{\"tier\":\"" + tier + "\",\"client_token\":\"" + client_token() + "\"}"
+        var rd = core.post(c, base + "/redeem", payload, false)
+        // 档位标识被判未知时**退回天数再试一次**：这类 400 是参数校验阶段的拒绝，
+        // 服务端没兑换任何东西，重试不会重复领取
+        if is_unknown_tier(rd.code, rd.body) {
+            var payload2 = "{\"tier\":" + days + ",\"client_token\":\"" + client_token() + "\"}"
+            rd = core.post(c, base + "/redeem", payload2, false)
+        }
+        // 403「连登天数不足」是业务常态，必须**先于** check_auth 判断：
+        // 否则未解锁档位会被当成权限拒绝、直接中止整个成长中心
+        if is_tier_locked(rd.code, rd.body) {
+            g.parts.add("连登兑换「" + label + "」未解锁（连登天数不足）")
+            continue
+        }
+        if check_auth(g, rd.code) { return }
+        if ok_code(rd.code) {
+            g.credits = g.credits + core.as_int(core.dig(rd.body, "credit_granted"), 0)
+            g.parts.add("连登兑换「" + label + "」" + redeem_reward_desc(rd.body, tier))
+            g.successes = g.successes + 1
+        } else {
+            add_failure(g, rd.code, "连登兑换「" + label + "」", body_msg(rd.body))
+        }
+    }
+}
+
+// 兑换成功的奖励描述：优先拼服务端实发的 *_granted，挖不到才回落官方文案。
+// ⚠ 实发字段名带 `_granted` 后缀；直接读 `credit` 恒为空，会把兑换所得漏计。
+func redeem_reward_desc(Dict[string, any] body, string tier): string {
+    var bits = []
+    var credit = core.as_int(core.dig(body, "credit_granted"), 0)
+    var energy = core.as_int(core.dig(body, "energy_granted"), 0)
+    var cards = core.as_int(core.dig(body, "cards_granted"), 0)
+    var chances = core.as_int(core.dig(body, "chances_granted"), 0)
+    if credit > 0 { bits.add("+" + _str(credit) + " 积分") }
+    if energy > 0 { bits.add("+" + _str(energy) + " 能量") }
+    if cards > 0 { bits.add("+" + _str(cards) + " 补登卡") }
+    if chances > 0 { bits.add("+" + _str(chances) + " 次抽奖") }
+    if bits.len() > 0 { return "（" + strings.join(bits, " ") + "）" }
+    var fallback = "奖励已到账"
+    if REDEEM_FALLBACK.has(tier) { fallback = REDEEM_FALLBACK.get(tier) }
+    return "（" + fallback + "）"
+}
+
+// tier 被判为"未知档位"：这类 400 发生在参数校验阶段，服务端没兑换任何东西 ⇒ 可安全换写法重试。
+// 历史教训：曾据"传天数返回 invalid request"误判 tier 要收数字，导致兑换模块连坏三个版本 ——
+// "业务拒绝"的文案不能反推参数格式正确，必须拿到一次成功响应才算验证过。
+export func is_unknown_tier(int code, Dict[string, any] body): bool {
+    if code != 400 { return false }
+    var msg = body_msg(body).to_lower()
+    if not msg.has("tier") { return false }
+    return msg.has("unknown") or msg.has("unsupported") or msg.has("invalid")
+}
+
+// 未解锁档位：403 +「连续登录天数不足」—— 业务常态，不是故障
+export func is_tier_locked(int code, Dict[string, any] body): bool {
+    if code != 403 { return false }
+    var msg = body_msg(body)
+    return msg.has("天数不足") or msg.has("不足")
+}
+
+// ==================== ⑤ 盲盒 / ⑥ 能量开 Buddy ====================
+// 抽奖失败是否只是"没有次数"——这是常态，不是故障。
+// 服务端对"次数为 0"返回 400 + `insufficient lottery chance balance`，和真正的参数错误
+// 同为 400；只看状态码会把两者混为一谈。
+export func is_no_chance(string msg): bool {
+    var m = msg.to_lower()
+    if m == "" { return false }
+    if m.has("insufficient") or m.has("not enough") {
+        return m.has("chance") or m.has("balance")
+    }
+    return m.has("no chance")
+}
+
+func step_lottery(Growth g, HttpClient c, string base) {
+    var l = core.get_json(c, base + "/lottery/chances")
+    if check_auth(g, l.code) { return }
+    var chances = 0
+    if not note_http(g, l.code, l.body, "查抽奖机会", false) {
+        chances = core.as_int(core.dig(l.body, "balance"), 0)
+    }
+    if chances <= 0 { return }
+    var d = core.post(c, base + "/lottery/draw", "{\"client_token\":\"" + client_token() + "\"}", false)
+    if check_auth(g, d.code) { return }
+    if ok_code(d.code) {
+        var prize = core.fmt_credit(core.dig(d.body, "prize_name"))
+        if prize == "null" { prize = core.fmt_credit(core.dig(d.body, "prize")) }
+        if prize == "null" { prize = "未知" }
+        // 奖池含实物周边：中奖后要用户自己去填收件信息 —— 脚本代填不了，但必须提醒
+        if core.as_bool(core.dig(d.body, "need_address")) or core.as_bool(core.dig(d.body, "require_address")) {
+            prize = prize + "（实物奖，需到成长中心填写收件信息）"
+        }
+        g.parts.add("开盲盒获得：" + prize)
+        g.successes = g.successes + 1
+        if chances > 1 { g.parts.add("还剩 " + _str(chances - 1) + " 次抽奖机会，下轮继续") }
+    } else {
+        var msg = body_msg(d.body)
+        if is_no_chance(msg) {
+            g.parts.add("开盲盒：" + msg)
+        } else {
+            add_failure(g, d.code, "开盲盒", msg)
+        }
+    }
+}
+
+func step_buddy_box(Growth g, HttpClient c, string base) {
+    var q = core.get_json(c, base + "/buddy/quota")
+    if check_auth(g, q.code) { return }
+    if note_http(g, q.code, q.body, "查 Buddy 能量", false) { return }
+    var affordable = core.as_int(core.dig(q.body, "affordable"), 0)
+    var max_open = core.as_int(core.dig(q.body, "max_open_count"), 1)
+    if max_open < 1 { max_open = 1 }
+    if affordable <= 0 { return }
+    var count = affordable
+    if count > max_open { count = max_open }
+    var o = core.post(c, base + "/buddy/open",
+                      "{\"count\":" + _str(count) + ",\"client_token\":\"" + client_token() + "\"}", false)
+    if check_auth(g, o.code) { return }
+    if ok_code(o.code) {
+        var name = core.dig(o.body, "buddy")
+        if name == null { name = core.dig(o.body, "name") }
+        if name == null { name = core.dig(o.body, "buddies") }
+        var shown = "新 Buddy"
+        if name is string => ns { shown = ns }
+        g.parts.add("开 Buddy 盲盒 ×" + _str(count) + "（" + shown + "）")
+        g.successes = g.successes + 1
+    } else {
+        add_failure(g, o.code, "开 Buddy 盲盒", body_msg(o.body))
+    }
+}
+
+// ==================== ⑦ 展示值：能量 & 连签 ====================
+func step_energy(Growth g, HttpClient c, string base) {
+    if core.budget_left() <= 0.0 { return }
+    var e = core.get_json(c, base + "/energy")
+    if check_auth(g, e.code) { return }
+    if not ok_code(e.code) { return }
+    var balance = core.dig(e.body, "balance")
+    if balance == null { return }
+    g.energy = core.as_int(balance, 0)
+    g.has_energy = true
+}
+
+func step_streak_days(Growth g, HttpClient c, string base) {
+    // 补登成功会改变天数 ⇒ 那时才需要重新取；否则复用 ③ 段拿到的同一份
+    if g.streak_raw != "" and not g.streak_stale {
+        var from_cache = streak_days_of(g.streak_raw)
+        if from_cache >= 0 {
+            g.streak_days = from_cache
+            g.has_streak = true
+        }
+        return
+    }
+    if core.budget_left() <= 0.0 { return }
+    var s = core.get_json(c, base + "/streak")
+    if check_auth(g, s.code) { return }
+    if not ok_code(s.code) { return }
+    g.streak_raw = ""
+    var days = streak_days_of_obj(s.body)
+    if days >= 0 {
+        g.streak_days = days
+        g.has_streak = true
+    }
+}
+
+// 取不到给 -1（"没有这个字段"和"天数是 0"必须分得开）
+func streak_days_of(string raw): int {
+    var parsed = null
+    try { parsed = jsons.decode(raw) } catch e { return -1 }
+    var d = parsed as Dict[string, any]
+    if d == null { return -1 }
+    return streak_days_of_obj(d)
+}
+
+func streak_days_of_obj(Dict[string, any] body): int {
+    var streak = core.dig(body, "streak") as Dict[string, any]
+    if streak == null { return -1 }
+    var days = streak.get("days")
+    if days == null { return -1 }
+    return core.as_int(days, -1)
+}
+
+// ==================== 主流程 ====================
+export func run_growth(HttpClient c, string endpoint): Dict[string, any] {
+    var base = endpoint + GROWTH_PATH
+    var g = new Growth()
+    // 每个子步骤都包在 try 里：一段失败不影响其余领取
+    safe(g, "旅行模块", step_travel, c, base)
+    if g.aborted { return g.abort_out }
+    safe(g, "任务模块", step_tasks, c, base)
+    if g.aborted { return g.abort_out }
+    safe(g, "补登模块", step_makeup, c, base)
+    if g.aborted { return g.abort_out }
+    safe(g, "连登兑换模块", step_redeem, c, base)
+    if g.aborted { return g.abort_out }
+    safe(g, "盲盒模块", step_lottery, c, base)
+    if g.aborted { return g.abort_out }
+    safe(g, "Buddy 盲盒模块", step_buddy_box, c, base)
+    if g.aborted { return g.abort_out }
+    // 展示值：纯读，失败就跳过（绝不能因为展示信息让整轮失败）
+    try { step_energy(g, c, base) } catch e { var _energy_failed = true }
+    try { step_streak_days(g, c, base) } catch e { var _streak_failed = true }
+
+    var tail = []
+    if g.has_energy { tail.add("能量 " + _str(g.energy)) }
+    if g.has_streak { tail.add("连签 " + _str(g.streak_days) + " 天") }
+    if g.credits != 0 { tail.add("本次 +共 " + _str(g.credits) + " 积分") }
+
+    var report = ""
+    if g.parts.len() > 0 {
+        report = strings.join(g.parts, "；")
+    } else if g.failures > 0 {
+        report = "成长中心各步骤均失败"
+    } else {
+        report = "成长中心无可领取项"
+    }
+    if tail.len() > 0 { report = report + "（" + strings.join(tail, "，") + "）" }
+
+    // 已获得的奖励仍保留在汇报里，但不能掩盖其他步骤需要处理的失败。
+    // idle = 这一轮既没领到东西也没出错，纯空跑（Buddy 还在路上 / 名额已用完 / 确实没有可领项）
+    Dict[string, any] out = {"result": "GROWTH", "report": report, "credits_gained": g.credits,
+                             "energy": null, "streak_days": null,
+                             "idle": (g.successes == 0 and g.failures == 0)}
+    if g.has_energy { out.set("energy", g.energy) }
+    if g.has_streak { out.set("streak_days", g.streak_days) }
+    if g.failures > 0 { out.set("failures", g.failures) }
+    if g.hard_failures > 0 { out.set("_code", 1) }
+    if g.successes > 0 { out.set("_successes", g.successes) }
+    return out
+}
+
+// 子步骤的异常兜底：异常不会静默消失，进报告、计失败
+func safe(Growth g, string label, func(Growth, HttpClient, string) step, HttpClient c, string base) {
+    try {
+        step(g, c, base)
+    } catch e {
+        g.parts.add(label + "异常（" + core.clip(_str(e.msg), 160) + "）")
+        g.failures = g.failures + 1
+        g.hard_failures = g.hard_failures + 1
+    }
+}

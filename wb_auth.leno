@@ -1,0 +1,730 @@
+// wb_auth.leno — 凭据：定位 / 校验 / 解密 / 请求头
+//
+// 安全边界（三条硬规矩）：
+//   ① 只**读**本机登录态文件，绝不改写；
+//   ② **永不打印 token**（进入 `core.add_sensitive` 后，输出里的它都会被 [REDACTED]）；
+//   ③ 加密凭据的密钥只在**短生命周期的客户端子进程内**使用 —— 不认识它、不落盘、不缓存。
+//
+// 解密为什么要拉起客户端自己（`WorkBuddy.exe`）：密钥（atRestSecretKey）只存在于客户端的
+// 原生存储接口里（`electron_browser_workbuddy_storage`，编译进客户端自身、并不落盘成文件），
+// 没有它就没法算 AES-256-GCM 的密钥；所以要把一段 JS 喂给客户端、以 node 模式跑。
+//   · Leno 的 `_exec` 只有"合并 stdout+stderr"一个出口、没有 stdin
+//     ⇒ 这里改成**环境变量传入 + 结果落盘**（下面的 WB_HELPER_* 协议），
+//     用 `_spawn`（CreateProcessW，不经 cmd）拉起，顺手避开"路径带空格时 cmd 引号被吞"的坑 ✓
+//   · 助手源码**内嵌在下面的 HELPER_JS 原始字符串里**（不再是独立的 .js 文件）：
+//     ① 原始字符串不吃转义 ⇒ JS 可以逐行照抄、可读可审阅（只要注释里不用半角双引号）；
+//     ② 命令行只传一句 `-e "eval(process.env.WB_HELPER_JS)"`（无内层引号、无长度压力），
+//        代码本体走环境变量 ⇒ **全程不落盘**，连临时文件都不需要，打包也不必再嵌资源。
+import jsons
+import strings
+import files
+import dirs
+import rands
+import "wb_core.leno" as core
+import "wb_envelope.leno" as envelope
+use core.(HttpClient)
+
+var AUTH_BASENAME = dirs.join(dirs.join(dirs.join(dirs.join("CodeBuddyExtension", "Data"),
+                                                     "Public"), "auth"), "workbuddy-desktop.info")
+// Linux 没有桌面端，入口是 CodeBuddy CLI：文件名不同、放在 XDG 数据目录（JSON 结构与桌面端一致）
+var CLI_AUTH_BASENAME = "Tencent-Cloud.coding-copilot.info"
+var HELPER_TIMEOUT_MS = 10000
+// 助手命令行：只有这一句，**没有内层引号**（代码本体走环境变量 WB_HELPER_JS）
+// ⚠ 这里曾经走 base64 中转 —— 当时的判断是"`_env` 传不了含换行的值"，**那个判断是错的**：
+//   2026-10-14 查清，换行、500 行、8000 字节的长值全都能正常传递；真正会失败的是**非 ASCII 值**
+//   （老 VM 的 `_env` 走窄口 `_putenv_s`，按 ANSI 代码页转 UTF-8 字节，CP936 下必然失败 ⇒
+//   变量从没进 Win32 环境块，子进程读到空；而本进程却能读回 —— 很有欺骗性）。
+//   这份 JS 里全是中文注释，于是"非 ASCII 失败"被误读成了"多行截断" ✗。
+//   VM 侧已修（非 ASCII 走 `SetEnvironmentVariableW`，见 docs/module_sys.md）⇒ 现在直传源码即可 ✓
+var HELPER_ARGV = "-e \"eval(process.env.WB_HELPER_JS)\""
+// 是不是内置 node 运行时（ELECTRON_RUN_AS_NODE=1）由客户端自己判断，这里只负责把参数摆对
+
+// ==================== 凭据助手源码（内嵌）====================
+// 为什么内嵌成字符串而不是留一个 wb_helper.js：
+//   ① 它本来就只在**客户端进程里**执行，落一份 .js 到磁盘只是传输介质，没有独立价值；
+//   ② 少一个文件 ⇒ 少一处"打包没带上/被用户删掉/被安全软件拦下"的失败面（打包也就不必嵌资源了）；
+//   ③ 全程不落盘 ⇒ 磁盘上不会出现任何与凭据处理相关的临时脚本。
+// 原始字符串（@"..."）不处理转义，所以下面这段 JS 可以逐行照抄、保持可读。
+// ⚠ 两条硬约束（改它时一定遵守）：
+//   · 注释与字符串里**只能**用半角单引号或全角引号（半角双引号会提前结束原始字符串）；
+//   · 内容必须与"客户端里真实存在的接口"保持同步：这个文件是唯一的实现，没有第二份拷贝。
+export var HELPER_JS = @"'use strict';
+// 凭据助手（跑在 WorkBuddy 客户端自己的运行时里）
+//
+// 它由 wb_auth.leno 用 _spawn 拉起客户端并执行，只为了拿到一样东西 ——
+// 客户端原生存储里的 at-rest 密钥（electron_browser_workbuddy_storage.loggerGet()）。
+// 那个接口编译在客户端自身、不落盘成文件，所以没有第二种拿法。
+//
+// I/O 通道的选择：
+//   源码与请求参数走环境变量、结果落盘 —— 拉起通道是 _spawn（CreateProcessW，
+//   不经 cmd），顺带避开「exe 路径带空格时 cmd 吞引号」那个坑；代价是没有 stdin 可喂
+//   （_exec 的三参形态能喂 stdin，但它经 cmd，路径带空格时就得跟引号规则搏斗 —— 不划算）。
+//
+// 安全边界（一条都不能松）：
+//   · 密钥只在本进程内存里用一次，随即置零；不落盘、不缓存、不回传；
+//   · 只输出 accessToken（或固定原因码），绝不输出密钥/中间态；
+//   · 输入输出都只有固定几支环境变量，没有业务参数 —— 命令行里不留任何凭据线索。
+//
+// 环境变量协议：
+//   WB_HELPER_AUTH  登录态文件路径（JSON，读它拿 auth.accessToken）
+//   WB_HELPER_OUT   结果写到这里（JSON：{version,ok,accessToken} 或 {version,ok:false,reason}）
+//   WB_HELPER_OP    'probe'（只探测能力） / 'decrypt'（默认，真解密）
+// 退出码恒为 0：成败由结果文件里的 ok 字段表达。
+const fs = require('fs');
+const crypto = require('crypto');
+const inputLimit = 65536;
+
+const AUTH = process.env.WB_HELPER_AUTH || '';
+const OUT = process.env.WB_HELPER_OUT || '';
+const OP = process.env.WB_HELPER_OP || 'decrypt';
+
+// 失败原因只用固定码（跨进程边界不传自由文本，免得把凭据片段带进日志）
+const failure = reason => { throw { reason }; };
+const object = x => x !== null && typeof x === 'object' && !Array.isArray(x);
+
+function base64(value, length) {
+    if (typeof value !== 'string' || value.length > inputLimit) failure('INVALID_FORMAT');
+    const bytes = Buffer.from(value, 'base64');
+    if (bytes.toString('base64') !== value || (length !== undefined && bytes.length !== length))
+        failure('INVALID_FORMAT');
+    return bytes;
+}
+
+function utf8(bytes) {
+    const text = bytes.toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(bytes)) failure('INVALID_FORMAT');
+    return text;
+}
+
+// 信封：{$wbEncrypted:1, envelope:<base64>{suite,keyId,nonce,authTag,ciphertext}}
+// 只认 sym-v1 / suite 1；其余一律 UNSUPPORTED_ENVELOPE（重登**不会**改变加密格式，别误导用户）
+function decode(value) {
+    if (!object(value) || Object.keys(value).sort().join(',') !== '$wbEncrypted,envelope' || value.$wbEncrypted !== 1)
+        failure('UNSUPPORTED_ENVELOPE');
+    let envelope;
+    try { envelope = JSON.parse(utf8(base64(value.envelope))); }
+    catch (e) { failure(e.reason || 'INVALID_FORMAT'); }
+    if (!object(envelope) || !Number.isInteger(envelope.suite)) failure('INVALID_FORMAT');
+    if (envelope.suite !== 1) failure('UNSUPPORTED_ENVELOPE');
+    if (Object.keys(envelope).sort().join(',') !== 'authTag,ciphertext,keyId,nonce,suite' ||
+        typeof envelope.keyId !== 'string' || !/^[0-9a-f]{16}$/.test(envelope.keyId)) failure('INVALID_FORMAT');
+    return {
+        keyId: envelope.keyId,
+        nonce: base64(envelope.nonce, 12),
+        tag: base64(envelope.authTag, 16),
+        ciphertext: base64(envelope.ciphertext)
+    };
+}
+
+// 客户端的原生存储接口：拿到 at-rest 密钥的唯一入口（密钥由内核级凭据库托管）
+function nativeStorage() {
+    try {
+        const storage = process._linkedBinding('electron_browser_workbuddy_storage');
+        if (typeof storage.loggerGet !== 'function') failure('RUNTIME_UNAVAILABLE');
+        return storage;
+    } catch (_) { failure('RUNTIME_UNAVAILABLE'); }
+}
+
+function decrypt(envelope) {
+    let payload;
+    try { payload = JSON.parse(nativeStorage().loggerGet()); }
+    catch (_) { failure('RUNTIME_UNAVAILABLE'); }
+    let key;
+    let plaintext;
+    try {
+        if (!object(payload) || payload.version !== 1) failure('RUNTIME_UNAVAILABLE');
+        let secret;
+        try { secret = base64(payload.atRestSecretKey, 32); }
+        catch (_) { failure('RUNTIME_UNAVAILABLE'); }
+        const empty = secret.every(b => b === 0);
+        secret.fill(0);
+        if (empty) failure('RUNTIME_UNAVAILABLE');
+        key = crypto.createHash('sha256').update(payload.atRestSecretKey, 'utf8').digest();
+        payload = null;
+        // keyId 就是密钥指纹的前 16 个十六进制字符 ⇒ 对不上说明凭据与这个客户端不是一对
+        if (crypto.createHash('sha256').update(key).digest('hex').slice(0, 16) !== envelope.keyId)
+            failure('KEY_MISMATCH');
+        // AAD 布局逐字照抄客户端：WB-AAD\0 | 0x01 | lp(WBEV1) | lp(sym-v1) | 0,0,0,1 | lp(keyId) | 2,0,0
+        const lp = s => {
+            const bytes = Buffer.from(s, 'utf8');
+            const length = Buffer.alloc(4);
+            length.writeUInt32BE(bytes.length);
+            return Buffer.concat([length, bytes]);
+        };
+        const aad = Buffer.concat([Buffer.from('WB-AAD\0', 'ascii'), Buffer.from([1]),
+            lp('WBEV1'), lp('sym-v1'), Buffer.from([0, 0, 0, 1]), lp(envelope.keyId), Buffer.from([2, 0, 0])]);
+        try {
+            const cipher = crypto.createDecipheriv('aes-256-gcm', key, envelope.nonce, { authTagLength: 16 });
+            cipher.setAAD(aad);
+            cipher.setAuthTag(envelope.tag);
+            plaintext = Buffer.concat([cipher.update(envelope.ciphertext), cipher.final()]);
+        } catch (_) { failure('DECRYPT_FAILED'); }
+        const token = utf8(plaintext);
+        if (!token.length || token.length > 32768 || !/^[A-Za-z0-9._~+\/-]+=*$/.test(token))
+            failure('INVALID_FORMAT');
+        return token;
+    } finally {
+        if (key) key.fill(0);
+        if (plaintext) plaintext.fill(0);
+    }
+}
+
+const REASONS = ['INVALID_FORMAT', 'UNSUPPORTED_ENVELOPE', 'RUNTIME_UNAVAILABLE',
+    'KEY_MISMATCH', 'DECRYPT_FAILED', 'HELPER_PROTOCOL'];
+
+function reply(value) {
+    const text = JSON.stringify(Object.assign({ version: 1 }, value));
+    if (OUT) { try { fs.writeFileSync(OUT, text, 'utf8'); } catch (_) { /* 落盘失败也照走 stdout */ } }
+    process.stdout.write(text + '\n');
+    process.exit(0);
+}
+
+try {
+    if (OP === 'probe') {
+        nativeStorage();
+        if (!crypto.getCiphers().includes('aes-256-gcm')) failure('RUNTIME_UNAVAILABLE');
+        reply({ ok: true, electron: process.versions.electron || 'unknown' });
+    }
+    const session = JSON.parse(fs.readFileSync(AUTH, 'utf8'));
+    if (!object(session) || !object(session.auth)) failure('INVALID_FORMAT');
+    reply({ ok: true, accessToken: decrypt(decode(session.auth.accessToken)) });
+} catch (e) {
+    reply({ ok: false, reason: REASONS.includes(e && e.reason) ? e.reason : 'HELPER_PROTOCOL' });
+}
+"
+var TOKEN_LIMIT = 32768
+export var AUTH_REASONS = ["INVALID_FORMAT", "UNSUPPORTED_ENVELOPE", "RUNTIME_NOT_FOUND",
+                    "INVALID_RUNTIME_PATH", "RUNTIME_UNAVAILABLE", "KEY_MISMATCH",
+                    "DECRYPT_FAILED", "HELPER_TIMEOUT", "HELPER_PROTOCOL"]
+
+// ==================== ① 定位凭据文件 ====================
+// 返回 [path, ...脚本实际检查过的路径]。path == "" ⇒ 没找到；
+// 候选清单随返回值一起给出，是为了让 NO_AUTH 报错里的路径**不可能与实现漂移**。
+export func find_auth_file(): Array[string] {
+    var override = _env_or("WORKBUDDY_AUTH_FILE", "")
+    if override != "" {
+        // 环境变量优先，但文件不存在时单独报告，不给无关建议
+        if files.exists(override) { return [override, override] }
+        return ["", override]
+    }
+    var home = _env_or("USERPROFILE", "")
+    if home == "" { home = _env_or("HOME", "") }
+    var local = _env_or("LOCALAPPDATA", dirs.join(dirs.join(home, "AppData"), "Local"))
+    var xdg = _env_or("XDG_DATA_HOME", dirs.join(dirs.join(home, ".local"), "share"))
+    var cands = [
+        dirs.join(local, AUTH_BASENAME),                                      // Windows 桌面端
+        dirs.join(dirs.join(dirs.join(home, "Library"), "Application Support"), AUTH_BASENAME), // macOS
+        dirs.join(xdg, CLI_AUTH_BASENAME),                                    // Linux CodeBuddy CLI
+        dirs.join(dirs.join(home, ".config"), AUTH_BASENAME),                 // Linux（旧猜测，保留）
+        dirs.join(dirs.join(dirs.join(home, ".workbuddy"), "auth"), "workbuddy-desktop.info")   // 兜底
+    ]
+    var out = [""]
+    for cands to c {
+        out.add(c)
+        if out[0] == "" and files.exists(c) { out[0] = c }
+    }
+    return out
+}
+
+// 带重试的读取：客户端刷新 token 时会**短暂独占**凭据文件，恰好在那一刻读就是失败
+// （实测：定时任务两次撞锁、整轮直接放弃）。锁是瞬时的，等两秒再试即可。
+export func read_text(string path): string {
+    var tries = 0
+    while tries < 3 {
+        try {
+            return files.read(path)
+        } catch e {
+            if tries < 2 { sleep(2000) }
+        }
+        tries = tries + 1
+    }
+    throw "READ_FAILED"
+}
+
+// ==================== ② 校验登录态 ====================
+// 返回 "" = 通过；否则是"失败原因码"（交给 auth_failure 变成 NO_SESSION / AUTH_ERROR）
+//
+// 取值一律走 `x as Dict[string, any]` **安全转换**（不匹配给 null）：比嵌套 `is Dict => d`
+// 少一层缩进，而且拿到的是**带泛型参数的类型** ⇒ 元素能按类型取，不再一路 any 到底。
+export func validate_session(Dict[string, any] session): string {
+    var auth = session.get("auth") as Dict[string, any]
+    var account = session.get("account") as Dict[string, any]
+    if auth == null { return "MISSING_SESSION" }
+    if account == null { return "MISSING_SESSION" }
+    var at = auth.get("accessToken")
+    if at == null { return "MISSING_SESSION" }
+    if at is string => ats { if ats == "" { return "MISSING_SESSION" } }
+    var uid = account.get("uid")
+    if uid == null { return "MISSING_SESSION" }
+    if uid is string => us { if us == "" { return "MISSING_SESSION" } }
+    // uid / enterpriseId / domain 只要出现，就必须是"可见 ASCII"（不超过 2048 字符）
+    for ["uid", "enterpriseId"] to k {
+        if account.has(k) {
+            var v = account.get(k)
+            if v is string => vs {
+                if vs != "" and (vs.len() > 2048 or not printable_ascii(vs)) { return "INVALID_FORMAT" }
+            }
+        }
+    }
+    if auth.has("domain") {
+        var dv = auth.get("domain")
+        if dv is string => ds {
+            if ds != "" and (ds.len() > 2048 or not printable_ascii(ds)) { return "INVALID_FORMAT" }
+        }
+    }
+    // 端点被**显式覆盖**时跳过 https 校验：那是使用者自己指定的端点（离线 stub / 自建网关），
+    // 校验它反而会让"端到端离线回归"没法做
+    if _env_or("WORKBUDDY_API_BASE", "") != "" { return "" }
+    return validate_endpoint(endpoint_of(session))
+}
+
+// 端点：默认官方端点；显式给出时必须是干净的 https 地址（无空白/控制字符、无 userinfo/query/fragment）
+func validate_endpoint(string ep): string {
+    if ep == "" { return "INVALID_FORMAT" }
+    var n = ep.byte_len()
+    var i = 0
+    while i < n {
+        var b = ep.byte(i)
+        if b <= 32 or b == 127 { return "INVALID_FORMAT" }
+        i = i + 1
+    }
+    if not strings.starts_with(ep, "https://") { return "INVALID_FORMAT" }
+    var rest = ep.byte_slice(8, n - 1)
+    var host_end = rest.byte_len()
+    var slash = rest.byte_find("/")
+    if slash >= 0 { host_end = slash }
+    if host_end <= 0 { return "INVALID_FORMAT" }
+    var host = rest.byte_slice(0, host_end - 1)
+    if host == "" { return "INVALID_FORMAT" }
+    if host.byte_find("@") >= 0 { return "INVALID_FORMAT" }
+    if rest.byte_find("?") >= 0 { return "INVALID_FORMAT" }
+    if rest.byte_find("#") >= 0 { return "INVALID_FORMAT" }
+    if rest.byte_find(" ") >= 0 { return "INVALID_FORMAT" }
+    return ""
+}
+
+// 可见 ASCII（0x21..0x7E）
+func printable_ascii(string s): bool {
+    var i = 0
+    var n = s.byte_len()
+    while i < n {
+        var b = s.byte(i)
+        if b < 33 or b > 126 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// WORKBUDDY_API_BASE 是**测试/自建端点**钩子（对标 LenoTrae 里的 TRAE_API_BASE）：
+// 设了它就完全跳过凭据里的 endpoint —— 没有这条，离线回归就只能靠真接口，
+// "领取成功 / 已签 / 401 / 5xx 重试"这几条路径根本没法验证。
+export func endpoint_of(Dict[string, any] session): string {
+    var override = _env_or("WORKBUDDY_API_BASE", "").trim()
+    if override != "" { return strip_slash(override) }
+    var auth = session.get("auth") as Dict[string, any]
+    var ep = ""
+    if auth != null { ep = jsons.get_str(auth, "endpoint", "").trim() }
+    if ep == "" { return core.DEFAULT_ENDPOINT }
+    return strip_slash(ep)
+}
+
+func strip_slash(string s): string {
+    var out = s
+    while strings.ends_with(out, "/") and out.len() > 1 { out = out.slice(0, out.len() - 2) }
+    return out
+}
+
+// ==================== ③ token 形态与解密 ====================
+// 明文 / sym-v1 信封。**深校验交给助手里的 JS**，这里只做"够不够格送过去"的粗筛，
+// 免得把明显不是凭据的东西递进子进程。
+export func token_kind(any v): string {
+    if v is string => s {
+        if not valid_token(s) { throw "INVALID_FORMAT" }
+        return "plaintext"
+    }
+    var d = v as Dict[string, any]
+    if d == null { throw "INVALID_FORMAT" }
+    if d.len() != 2 { throw "UNSUPPORTED_ENVELOPE" }
+    if not d.has("$wbEncrypted") { throw "UNSUPPORTED_ENVELOPE" }
+    if not d.has("envelope") { throw "UNSUPPORTED_ENVELOPE" }
+    var flag = d.get("$wbEncrypted")
+    var flag_ok = false
+    if flag is int => fi { if fi == 1 { flag_ok = true } }
+    if not flag_ok { throw "UNSUPPORTED_ENVELOPE" }
+    if not (d.get("envelope") is string) { throw "INVALID_FORMAT" }
+    return "sym-v1"
+}
+
+// token 字符集：`[A-Za-z0-9._~+/-]+=*`，长度 (0, 32768]（JWT / 普通 bearer 都落在里面）
+export func valid_token(string t): bool {
+    var n = t.byte_len()
+    if n <= 0 or n > TOKEN_LIMIT { return false }
+    var i = 0
+    while i < n {
+        var b = t.byte(i)
+        var ok = false
+        if b >= 48 and b <= 57 { ok = true }        // 0-9
+        if b >= 65 and b <= 90 { ok = true }        // A-Z
+        if b >= 97 and b <= 122 { ok = true }       // a-z
+        if b == 46 or b == 95 or b == 126 { ok = true }   // . _ ~
+        if b == 43 or b == 47 or b == 45 { ok = true }    // + / -
+        if b == 61 { ok = true }                    // =
+        if not ok { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// 找客户端可执行文件：WORKBUDDY_EXE → 默认安装目录 → 注册表（Windows）
+export func find_runtime(): string {
+    var override = _env_or("WORKBUDDY_EXE", "")
+    if override != "" {
+        // 路径错了就直接报，不静默回退（回退到别的版本只会得到 KEY_MISMATCH，更难查）
+        if not files.exists(override) { throw "INVALID_RUNTIME_PATH" }
+        return override
+    }
+    var home = _env_or("USERPROFILE", "")
+    if home == "" { home = _env_or("HOME", "") }
+    var cands = []
+    if _os() == "windows" {
+        var local = _env_or("LOCALAPPDATA", dirs.join(dirs.join(home, "AppData"), "Local"))
+        cands.add(dirs.join(dirs.join(dirs.join(local, "Programs"), "WorkBuddy"), "WorkBuddy.exe"))
+        var pf = _env_or("ProgramFiles", "")
+        if pf != "" { cands.add(dirs.join(dirs.join(pf, "WorkBuddy"), "WorkBuddy.exe")) }
+        var pf86 = _env_or("ProgramFiles(x86)", "")
+        if pf86 != "" { cands.add(dirs.join(dirs.join(pf86, "WorkBuddy"), "WorkBuddy.exe")) }
+    } else if _os() == "macos" {
+        cands.add(mac_runtime("/Applications/WorkBuddy.app"))
+        cands.add(mac_runtime(dirs.join(dirs.join(home, "Applications"), "WorkBuddy.app")))
+    }
+    for cands to p {
+        if p != "" and files.exists(p) { return p }
+    }
+    if _os() == "windows" {
+        for registry_runtimes() to p {
+            if files.exists(p) { return p }
+        }
+    }
+    throw "RUNTIME_NOT_FOUND"
+}
+
+// macOS：从 .app 的 Info.plist 取 CFBundleExecutable（plist 是 XML，这里只做最小解析）
+func mac_runtime(string bundle): string {
+    var plist = dirs.join(dirs.join(bundle, "Contents"), "Info.plist")
+    if not files.exists(plist) { return "" }
+    var text = ""
+    try { text = files.read(plist) } catch e { return "" }
+    var marker = "<key>CFBundleExecutable</key>"
+    var at = text.find(marker)
+    if at < 0 { return "" }
+    var rest = text.slice(at + marker.len(), text.len() - 1)
+    var s = rest.find("<string>")
+    if s < 0 { return "" }
+    var e2 = rest.find("</string>", s)
+    if e2 < 0 { return "" }
+    var name = rest.slice(s + 8, e2 - 1).trim()
+    if name == "" { return "" }
+    return dirs.join(dirs.join(dirs.join(bundle, "Contents"), "MacOS"), name)
+}
+
+// Windows 注册表兜底：自定义安装目录（默认目录找不到时才走这里）。
+// 只**读**卸载条目里的 DisplayIcon，绝不执行 UninstallString（那是卸载命令，碰不得）。
+func registry_runtimes(): Array[string] {
+    var out = []
+    var roots = ["HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                 "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"]
+    for roots to root {
+        ExecResult? r = _exec("reg query \"" + root + "\" /s /f \"WorkBuddy.exe\" /d", 15000)
+        if r == null { continue }
+        if r.code != 0 { continue }
+        for r.output.lines() to line {
+            var t = line.trim()
+            var idx = t.byte_find("REG_SZ")
+            if idx < 0 { continue }
+            var value = t.byte_slice(idx + 6, t.byte_len() - 1).trim()
+            var path = registry_path(value)
+            if path != "" { out.add(path) }
+        }
+    }
+    return out
+}
+
+// DisplayIcon 形态：`C:\...\WorkBuddy.exe,0`，也可能带引号；只认 basename == WorkBuddy.exe
+func registry_path(string value): string {
+    var v = value.trim()
+    if strings.starts_with(v, "\"") and v.len() > 2 {
+        var end = v.slice(1, v.len() - 1).find("\"")
+        if end < 0 { return "" }
+        v = v.slice(1, end + 1).trim()
+    } else if v.has("\"") {
+        return ""
+    } else {
+        // 只去掉结尾的资源序号；逗号可能属于目录名
+        var comma = v.byte_find(",")
+        if comma >= 0 { v = v.byte_slice(0, comma - 1).trim() }
+    }
+    // 必须是带盘符的绝对路径（`C:\...`）或 UNC（`\\...`）
+    var absolute = strings.starts_with(v, "\\\\")
+    if v.len() > 2 and v.byte(1) == 58 { absolute = true }
+    if not absolute { return "" }
+    if not strings.ends_with(v.to_lower(), "workbuddy.exe") { return "" }
+    return v
+}
+
+// 以 node 模式跑客户端自己的运行时 → 用它的原生存储接口解密。
+// op: "probe"（只探测能力） / "decrypt"（真解密）
+export func run_helper(string op, string auth_path, string exe): Dict[string, any] {
+    if exe == "" or not files.exists(exe) { throw "RUNTIME_UNAVAILABLE" }
+    var out = dirs.join(_tmpdir(), "leno_wb_" + _str(_pid()) + "_" + _str(rands.ints(100000, 999999)) + ".json")
+    if files.exists(out) { files.delete(out) }
+
+    // 不把用户环境里的 NODE_* 带进去：stale 的 NODE_OPTIONS 会让客户端
+    // 以奇怪的方式启动，报出来的错还跟凭据八竿子打不着
+    if _env("NODE_OPTIONS") != null { _env("NODE_OPTIONS", "") }
+    // ⚠ 这两条**必须接返回值**：写失败时 `_env` 返回 false（例如值里带非 ASCII 而 VM 较旧），
+    //   忽略它等于让子进程"静默地少一个变量"，报出来的错会与真实原因完全对不上
+    if not _env("ELECTRON_RUN_AS_NODE", "1") { throw "RUNTIME_UNAVAILABLE" }
+    if not _env("WB_HELPER_JS", HELPER_JS) { throw "HELPER_PROTOCOL" }
+    _env("WB_HELPER_AUTH", auth_path)
+    _env("WB_HELPER_OUT", out)
+    _env("WB_HELPER_OP", op)
+
+    var handle = _spawn(exe, HELPER_ARGV)
+    if handle <= 0 {
+        if files.exists(out) { files.delete(out) }
+        throw "RUNTIME_UNAVAILABLE"
+    }
+    var ready = false
+    var waited = 0
+    while waited < HELPER_TIMEOUT_MS {
+        if files.exists(out) { ready = true; break }
+        sleep(50)
+        waited = waited + 50
+    }
+    _kill(handle)
+    if not ready { throw "HELPER_TIMEOUT" }
+
+    var text = ""
+    try { text = files.read(out) } catch e { text = "" }
+    try { files.delete(out) } catch e { var _cleanup_failed = true }
+    var reply = null
+    try { reply = jsons.decode(text) } catch e { reply = null }
+    var d = reply as Dict[string, any]
+    if d == null { throw "HELPER_PROTOCOL" }
+    if core.as_bool(core.dig(d, "ok")) { return d }
+    var reason = jsons.get_str(d, "reason", "")
+    if in_list(AUTH_REASONS, reason) { throw reason }
+    throw "HELPER_PROTOCOL"
+}
+
+export func in_list(Array[string] list, string v): bool {
+    for list to x {
+        if x == v { return true }
+    }
+    return false
+}
+
+// 登录态 → 可用的 access token。按"能不能拿到密钥"分两条路：
+//   ① 有密钥（WORKBUDDY_AT_REST_KEY）⇒ **纯 Leno** 解密：不启任何子进程、不依赖客户端运行时；
+//   ② 没有密钥 ⇒ 退回"让客户端运行时算"（内嵌助手，见 wb_envelope.leno 头部说明）。
+// 两条路的产物必须逐字节一致 —— 这一点已用真实凭据实测过（见 README「凭据与密钥」）。
+export func resolve_token(Dict[string, any] session, string auth_path): string {
+    var auth = session.get("auth") as Dict[string, any]
+    var value = null
+    if auth != null { value = auth.get("accessToken") }
+    var kind = token_kind(value)
+    if kind == "plaintext" {
+        var token = value as string
+        core.add_sensitive(token)
+        return token
+    }
+    var key = at_rest_key()
+    if key != "" {
+        var pure = envelope.decrypt_sym_v1(key, value)     // 失败按原因码抛（KEY_MISMATCH / DECRYPT_FAILED 等）
+        core.add_sensitive(pure)
+        return pure
+    }
+    var exe = find_runtime()
+    var reply = run_helper("decrypt", auth_path, exe)
+    var tok = jsons.get_str(reply, "accessToken", "")
+    if not valid_token(tok) { throw "HELPER_PROTOCOL" }
+    core.add_sensitive(tok)
+    return tok
+}
+
+// at-rest 密钥（base64 的 32 字节）来自环境变量。
+// 为什么留这个入口：密钥由客户端内核级存储托管，本工具**只读**、不生成也不持久化它；
+// 谁能提供密钥（自己保管 / 系统密钥库 / 将来接上的取密钥实现），谁就能走纯 Leno 那条路。
+export func at_rest_key(): string {
+    return _env_or("WORKBUDDY_AT_REST_KEY", "").trim()
+}
+
+// 当前会用哪条路解凭据（doctor 与日志里据此说明"到底跟客户端有没有关系"）
+export func credential_mode(): string {
+    if at_rest_key() != "" { return "pure-leno" }
+    return "client-runtime"
+}
+
+// ==================== 一条龙：从凭据文件到可用的 HTTP 客户端 ====================
+// CLI 与 GUI **共用这一条**（否则"登录态怎么读、请求头怎么摆"会在两处各长一份，迟早不一致）
+struct Conn {
+    bool ok = false
+    string err = ""                          // 人话错误（GUI 直接显示）
+    Dict[string, any] out = {}                // 结构化结果（与 emit 的字段同形，便于复用文案）
+    HttpClient? client = null
+    string endpoint = ""
+    string auth_path = ""
+}
+
+func conn_fail(string code, string text, Dict[string, any] detail): Conn {
+    var d = detail
+    d.set("result", code)
+    d.set("report", text)
+    d.set("needs_attention", true)
+    return new Conn(ok = false, err = text, out = d)
+}
+
+export func connect(): Conn {
+    var found = find_auth_file()
+    var path = found[0]
+    if path == "" {
+        var override = _env_or("WORKBUDDY_AUTH_FILE", "")
+        if override != "" {
+            return conn_fail("NO_AUTH", "WORKBUDDY_AUTH_FILE 指向的文件不存在：" + override, {})
+        }
+        var looked = []
+        var i = 1
+        while i < found.len() {
+            looked.add(found[i])
+            i = i + 1
+        }
+        return conn_fail("NO_AUTH",
+            "未找到 WorkBuddy 登录凭据。请先在本机登录 WorkBuddy 桌面端；或设置环境变量 WORKBUDDY_AUTH_FILE 指向 workbuddy-desktop.info。",
+            {"looked_in": looked})
+    }
+    var text = ""
+    try {
+        text = read_text(path)
+    } catch e {
+        return conn_fail("ERROR", "读取登录凭据失败（文件被占用或缺权限），请重新登录 WorkBuddy 桌面端", {})
+    }
+    var decoded = null
+    try { decoded = jsons.decode(text) } catch e { decoded = null }
+    var session = decoded as Dict[string, any]
+    if session == null {
+        return conn_fail("ERROR", "登录凭据文件不是合法 JSON（或内容损坏），请重新登录 WorkBuddy 桌面端", {})
+    }
+    var reason = validate_session(session)
+    if reason != "" { return new Conn(ok = false, err = reason_text(reason), out = auth_failure(reason), auth_path = path) }
+    var token = ""
+    try {
+        token = resolve_token(session, path)
+    } catch e {
+        var r = _str(e.msg)
+        if in_list(AUTH_REASONS, r) or r == "MISSING_SESSION" {
+            var f = auth_failure(r)
+            return new Conn(ok = false, err = jsons.get_str(f, "report", ""), out = f, auth_path = path)
+        }
+        return conn_fail("ERROR", "脚本运行异常（" + core.clip(r, 200) + "）", {})
+    }
+    var headers = []
+    try {
+        headers = build_headers(session, token)
+    } catch e {
+        var f2 = auth_failure("INVALID_FORMAT")
+        return new Conn(ok = false, err = jsons.get_str(f2, "report", ""), out = f2, auth_path = path)
+    }
+    var c = core.new_client(core.REQUEST_TIMEOUT * 1000)
+    c.replaceHeaders(headers)
+    var ep = endpoint_of(session)
+    return new Conn(ok = true, err = "", out = {}, client = c, endpoint = ep, auth_path = path)
+}
+
+// ==================== ④ 请求头 ====================
+// ⚠ 必须**一次设完**（`replaceHeaders` 是整表替换语义；分两次调用会把 Authorization 静默覆盖）
+export func build_headers(Dict[string, any] session, string token): Array[string] {
+    if not valid_token(token) { throw "INVALID_FORMAT" }
+    var uid = ""
+    var enterprise = ""
+    var domain = ""
+    var account = session.get("account") as Dict[string, any]
+    if account != null {
+        uid = jsons.get_str(account, "uid", "")
+        enterprise = jsons.get_str(account, "enterpriseId", "")
+    }
+    var auth = session.get("auth") as Dict[string, any]
+    if auth != null { domain = jsons.get_str(auth, "domain", "") }
+    var headers = [
+        "Accept: application/json",
+        "Authorization: Bearer " + token,
+        "Content-Type: application/json",
+        "X-User-Id: " + uid,
+        "User-Agent: WorkBuddy"
+    ]
+    if enterprise != "" {
+        headers.add("X-Enterprise-Id: " + enterprise)
+        headers.add("X-Tenant-Id: " + enterprise)
+    }
+    if domain != "" { headers.add("X-Domain: " + domain) }
+    return headers
+}
+
+// ==================== ⑤ 失败原因 → 人话 ====================
+export func reason_text(string reason): string {
+    if reason == "INVALID_FORMAT" { return "登录凭据格式无效，请检查凭据来源和客户端版本" }
+    if reason == "UNSUPPORTED_ENVELOPE" { return "尚不支持此加密凭据格式，请更新脚本；重新登录不会改变加密格式" }
+    if reason == "RUNTIME_NOT_FOUND" { return "未找到 WorkBuddy 客户端，请用 WORKBUDDY_EXE 指定其可执行文件" }
+    if reason == "INVALID_RUNTIME_PATH" { return "WORKBUDDY_EXE 不是可用的可执行文件，请核对路径" }
+    if reason == "RUNTIME_UNAVAILABLE" { return "客户端运行时不支持所需的原生存储接口，请检查客户端和脚本版本" }
+    if reason == "KEY_MISMATCH" { return "凭据与所选客户端的密钥不匹配，请用 WORKBUDDY_EXE 指定对应客户端" }
+    if reason == "DECRYPT_FAILED" { return "加密凭据认证失败，请检查客户端版本及凭据是否完整" }
+    if reason == "HELPER_TIMEOUT" { return "凭据处理超时，已停止子进程，请稍后重试" }
+    if reason == "HELPER_PROTOCOL" { return "客户端凭据助手返回无效结果，请检查客户端和脚本版本" }
+    if reason == "MISSING_SESSION" { return "本地缺少登录会话或必要字段，请先登录客户端" }
+    return "本地未找到有效登录会话，请先登录客户端"
+}
+
+// 结果码：MISSING_SESSION ⇒ NO_SESSION（"没登录"），其余 ⇒ AUTH_ERROR（"凭据本身有问题"）
+export func auth_failure(string reason): Dict[string, any] {
+    var result = "AUTH_ERROR"
+    if reason == "MISSING_SESSION" { result = "NO_SESSION" }
+    return {"result": result, "reason": reason, "report": reason_text(reason), "needs_attention": true}
+}
+
+// 401 / 403：只凭状态码**不能**断言"登录过期"，文案要如实说
+export func http_auth_failure(int code): Dict[string, any] {
+    if code == 401 {
+        return {"result": "AUTH_REJECTED", "http": code, "needs_attention": true,
+                "report": "服务端拒绝认证（HTTP 401），请检查客户端登录状态、凭据对应的服务地址及脚本版本"}
+    }
+    return {"result": "FORBIDDEN", "http": code, "needs_attention": true,
+            "report": "服务端拒绝此操作（HTTP 403），请检查账号权限或活动条件；不能据此判断登录过期"}
+}
+
+// ==================== ⑥ doctor：离线自检 ====================
+export func doctor_report(Dict[string, any] session): Dict[string, any] {
+    var reason = validate_session(session)
+    if reason != "" { return auth_failure(reason) }
+    var auth = session.get("auth") as Dict[string, any]
+    var value = null
+    if auth != null { value = auth.get("accessToken") }
+    var kind = token_kind(value)
+    var out = {"result": "AUTH_READY", "credential_format": kind, "needs_attention": false,
+               "credential_mode": credential_mode(),
+               "report": "本地凭据格式有效；未验证服务端登录状态", "online_checked": false}
+    if kind != "sym-v1" { return out }
+    if at_rest_key() != "" {
+        // 有密钥 ⇒ 顺手真解一次（纯 Leno、不联网）：能解出来才敢说这条路是通的
+        var token = envelope.decrypt_sym_v1(at_rest_key(), value)
+        core.add_sensitive(token)
+        out.set("token_length", token.len())
+        out.set("report", "已识别加密凭据，并用纯 Leno（AES-256-GCM）成功解密；未验证服务端登录状态")
+        return out
+    }
+    var exe = find_runtime()
+    var probe = run_helper("probe", "", exe)
+    out.set("runtime", exe)
+    out.set("electron_version", jsons.get_str(probe, "electron", "unknown"))
+    out.set("report", "已识别加密凭据，运行时具备解密能力；未提取密钥、未验证解密或服务端登录状态")
+    return out
+}

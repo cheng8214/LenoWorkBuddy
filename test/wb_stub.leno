@@ -1,0 +1,191 @@
+// test/wb_stub.leno — 离线 stub 服务端（够用的 HTTP/1.1 实现，只伺候回归测试）
+//
+// 为什么要有它：签到接口在**真实环境**里一天只能验证一次"未签→领取"，
+// 401 / 5xx 重试 / "服务端判已签" / "非签到季"这些路径平时根本撞不上，
+// 而它们恰恰是最容易写错的地方 ⇒ 用本地 stub 把整条链路端到端跑一遍。
+//
+// 用法：leno test\wb_stub.leno [port]
+//      环境变量 WB_STUB_MODE 选场景（见下面 mode 分支）；WB_STUB_MAX 限制处理多少个请求后退出。
+//
+// ⚠ 它**只**监听 127.0.0.1、只回预设 JSON，不含任何真实凭据逻辑。
+import sockets
+import strings
+import jsons
+
+struct Stub {
+    bool checked_in = false
+    int claims = 0
+    int requests = 0
+    string mode = "normal"
+}
+
+// 从连接上读完整的一个请求（头 + 按 Content-Length 读满 body）
+func read_request(Socket conn, Dict[string, any] info): string {
+    var head = ""
+    while true {
+        var chunk = conn.recv(4096)
+        if chunk == null { return "" }
+        head = head + chunk
+        if head.byte_find("\r\n\r\n") >= 0 { break }
+        if head.byte_len() > 65536 { return head }
+    }
+    var split = head.byte_find("\r\n\r\n")
+    var body_have = head.byte_slice(split + 4, head.byte_len() - 1)
+    var want = 0
+    for head.lines() to line {
+        var low = line.to_lower()
+        if strings.starts_with(low, "content-length:") {
+            want = _int(low.slice(15, low.len() - 1).trim())
+        }
+    }
+    while body_have.byte_len() < want {
+        var more = conn.recv(4096)
+        if more == null { break }
+        body_have = body_have + more
+    }
+    info.set("body", body_have)
+    var first = head.lines()[0]
+    var parts = first.split(" ")
+    if parts.len() >= 2 {
+        info.set("method", parts[0])
+        info.set("path", parts[1])
+    }
+    return head
+}
+
+func respond(Socket conn, int code, string body) {
+    var reason = "OK"
+    if code == 400 { reason = "Bad Request" }
+    if code == 401 { reason = "Unauthorized" }
+    if code == 403 { reason = "Forbidden" }
+    if code == 404 { reason = "Not Found" }
+    if code == 500 { reason = "Internal Server Error" }
+    var text = "HTTP/1.1 " + _str(code) + " " + reason + "\r\n"
+        + "Content-Type: application/json\r\n"
+        + "Content-Length: " + _str(body.byte_len()) + "\r\n"
+        + "Connection: close\r\n\r\n" + body
+    conn.send(text)
+    conn.close()
+}
+
+func status_body(Stub s): string {
+    if s.checked_in {
+        return "{\"code\":0,\"msg\":\"OK\",\"data\":{\"active\":true,\"today_checked_in\":true,"
+            + "\"streak_days\":7,\"today_credit\":100,\"daily_credit\":100,\"total_credits\":700,"
+            + "\"is_streak_day\":false,\"next_streak_day\":0,\"activity_name\":\"Buddy应用\"}}"
+    }
+    return "{\"code\":0,\"msg\":\"OK\",\"data\":{\"active\":true,\"today_checked_in\":false,"
+        + "\"streak_days\":6,\"today_credit\":0,\"daily_credit\":100,\"total_credits\":600,"
+        + "\"is_streak_day\":false,\"next_streak_day\":0,\"activity_name\":\"Buddy应用\"}}"
+}
+
+// 返回 [http_code, body]
+func route(Stub s, string method, string path): Array[string] {
+    // 场景开关（打哪条路径用哪个场景）
+    if s.mode == "unauthorized" { return ["401", "{\"code\":401,\"msg\":\"unauthorized\"}"] }
+    if s.mode == "server_error" { return ["500", "{\"code\":500,\"msg\":\"boom\"}"] }
+    if s.mode == "flaky" {
+        // 第一个请求 5xx、之后恢复正常：验证"服务端抖动按短促节奏重试"（3s 后重试成功）
+        if s.requests == 1 { return ["500", "{\"code\":500,\"msg\":\"flaky\"}"] }
+    }
+    if path == "/v2/billing/meter/checkin-activity-status" {
+        if s.mode == "inactive" {
+            return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"active\":false,\"activity_name\":\"Buddy应用\"}}"]
+        }
+        if s.mode == "already" {
+            s.checked_in = true
+            return ["200", status_body(s)]
+        }
+        return ["200", status_body(s)]
+    }
+    if path == "/v2/billing/meter/daily-checkin" {
+        if s.mode == "claim400" {
+            return ["400", "{\"code\":10001,\"msg\":\"今天已签到，请明天再来\"}"]
+        }
+        if s.mode == "null_body" { return ["200", "null"] }
+        s.checked_in = true
+        s.claims = s.claims + 1
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"credit\":100}}"]
+    }
+    // ---- 成长中心 ----
+    if path == "/v2/activity/growth/buddy/travel/status" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"state\":\"idle\",\"daily_limit_reached\":false}}"]
+    }
+    if path == "/v2/activity/growth/buddy/travel/config" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"locations\":[{\"id\":7,\"name\":\"咖啡馆\",\"duration_hours\":2}]}}"]
+    }
+    if path == "/v2/activity/growth/buddy/travel/depart" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"location\":{\"id\":7,\"name\":\"咖啡馆\",\"duration_hours\":2},\"duration_hours\":2}}"]
+    }
+    if path == "/v2/activity/growth/tasks" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"tasks\":["
+            + "{\"task_code\":\"t1\",\"title\":\"试用 Hy4\",\"accept_status\":\"not_accepted\",\"locked\":false},"
+            + "{\"task_code\":\"t2\",\"title\":\"写一句提示词\",\"accept_status\":\"completed\",\"locked\":false,"
+            + "\"reward_credit\":10,\"reward_energy\":1}]}}"]
+    }
+    if path == "/v2/activity/growth/tasks/accept" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"results\":[{\"task_code\":\"t1\",\"status\":\"ok\"}]}}"]
+    }
+    if path == "/v2/activity/growth/tasks/t2/claim" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"credit\":10,\"energy\":1,\"already_claimed\":false}}"]
+    }
+    if path == "/v2/activity/growth/streak" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"streak\":{\"days\":7,\"makeup_dates\":[]},"
+            + "\"launch_date\":\"2026-06-17\",\"makeup_cards\":{\"balance\":1}}}"]
+    }
+    if path == "/v2/activity/growth/heatmap" {
+        // today = 2026-10-14；10-12 / 10-11 是断点（score 0），10-14 当天不补
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"today\":{\"date\":\"2026-10-14\"},\"cells\":["
+            + "{\"date\":\"2026-10-13\",\"score\":100},{\"date\":\"2026-10-12\",\"score\":0},"
+            + "{\"date\":\"2026-10-11\",\"score\":0},{\"date\":\"2026-10-14\",\"score\":0}]}}"]
+    }
+    if path == "/v2/activity/growth/makeup-cards/use" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"makeup_cards\":{\"balance\":0}}}"]
+    }
+    if path == "/v2/activity/growth/redeem/summary" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"starter_status\":\"locked\","
+            + "\"advanced_status\":\"locked\",\"legendary_status\":\"locked\"}}"]
+    }
+    if path == "/v2/activity/growth/lottery/chances" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"balance\":1}}"]
+    }
+    if path == "/v2/activity/growth/lottery/draw" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"prize_name\":\"2 积分\"}}"]
+    }
+    if path == "/v2/activity/growth/buddy/quota" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"affordable\":1,\"max_open_count\":5}}"]
+    }
+    if path == "/v2/activity/growth/buddy/open" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"buddy\":\"小北\"}}"]
+    }
+    if path == "/v2/activity/growth/energy" {
+        return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"balance\":42}}"]
+    }
+    return ["404", "{\"code\":404,\"msg\":\"no route: " + path + "\"}"]
+}
+
+main() {
+    var args = _args()
+    var port = 8791
+    if args.len() > 0 { port = _int(args[0]) }
+    var max_requests = _int(_env_or("WB_STUB_MAX", "200"))
+    var s = new Stub(mode = _env_or("WB_STUB_MODE", "normal"))
+    var srv = sockets.listen("127.0.0.1", port)
+    if srv == null {
+        print("STUB_LISTEN_FAILED " + _str(port))
+        _exit(1)
+    }
+    print("STUB_READY " + _str(port) + " mode=" + s.mode)
+    while s.requests < max_requests {
+        var conn = srv.accept()
+        if conn == null { break }
+        var info = {}
+        read_request(conn, info)
+        s.requests = s.requests + 1
+        var method = jsons.get_str(info, "method", "")
+        var path = jsons.get_str(info, "path", "")
+        var result = route(s, method, path)
+        respond(conn, _int(result[0]), result[1])
+    }
+    srv.close()
+}

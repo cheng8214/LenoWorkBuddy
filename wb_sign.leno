@@ -1,0 +1,259 @@
+// wb_sign.leno — WorkBuddy 自动签到（CLI 入口）
+//
+// 用法（位置子命令）：
+//   leno wb_sign.leno auto           # 签到 + 成长中心（默认动作）
+//   leno wb_sign.leno silent         # 同 auto，但结果写日志文件而非 stdout（配合无窗口定时任务）
+//   leno wb_sign.leno growth         # 仅成长中心（不签到）
+//   leno wb_sign.leno silent-poll    # 轮询：补签（未签才签）+ 成长中心，空跑不写日志
+//   leno wb_sign.leno silent-growth  # silent-poll 的旧名，行为完全相同
+//   leno wb_sign.leno status         # 仅查签到状态（调试）
+//   leno wb_sign.leno claim          # 仅领取签到（调试，幂等）
+//   leno wb_sign.leno all            # 查签到状态 + 领取（调试）
+//   leno wb_sign.leno doctor         # 离线检查凭据格式与运行时能力，不解密、不联网
+//
+// 退出码：0 成功（含"今日已签"与"非签到季"）／1 认证·网络·需要关注的失败／2 用法与环境错误。
+import jsons
+import strings
+import "wb_core.leno" as core
+import "wb_auth.leno" as auth
+import "wb_checkin.leno" as checkin
+import "wb_growth.leno" as growth
+use core.(HttpClient, ApiResp)
+
+var KNOWN_ACTIONS = ["auto", "silent", "growth", "silent-poll", "silent-growth",
+                     "status", "claim", "all", "doctor"]
+var SIMPLE_ACTIONS = ["auto", "silent"]
+var POLL_ACTIONS = ["silent-poll", "silent-growth"]
+
+// 一轮完整的日常（签到 + 成长中心）的结果
+struct Daily {
+    int code = 0
+    bool quiet = false
+    Dict[string, any] out = {}
+}
+
+// 剥掉内部字段（下划线开头），只留对外契约里的键
+func public_out(Dict[string, any] d): Dict[string, any] {
+    var out = {}
+    for d.keys() to k {
+        if not strings.starts_with(k, "_") { out.set(k, d.get(k)) }
+    }
+    return out
+}
+
+// 原因码 → 输出。**引擎错误**（不是我们 throw 的那些）也不能静默丢失 ⇒ 归到 ERROR。
+func from_reason(string reason): Dict[string, any] {
+    if auth.in_list(auth.AUTH_REASONS, reason) or reason == "MISSING_SESSION" {
+        return auth.auth_failure(reason)
+    }
+    return {"result": "ERROR", "report": "脚本运行异常（" + core.clip(reason, 300) + "）", "needs_attention": true}
+}
+
+// ==================== 一轮日常 ====================
+// 轮询之所以要跑"签到 + 成长中心"而不是"只跑成长中心"：签到原本一天只有 00:05 这一次机会，
+// 那一次撞上关机/睡眠/刚开机网络没就绪，当天就再无补救、连签直接断。让每一次轮询都带上签到，
+// 等于一天七次机会，且不会重复领取（接口幂等，已签直接返回 ALREADY）。
+func run_daily(HttpClient c, string endpoint): Daily {
+    var a = checkin.run_auto(c, endpoint)
+    // ⚠ 必须**显式标注**容器类型：`var out = a.out` 会被编译器当成"待推断字典"，
+    //   随后按第一次 `set` 的值类型定死（先 set 字符串 ⇒ 再 set bool 就报类型错）
+    Dict[string, any] out = a.out
+    var result = jsons.get_str(out, "result", "")
+    if result == "NETWORK" or result == "TIMEOUT" {
+        // 网络本就不可达时不必再跑成长中心那串请求（每个都要重试+等待），
+        // 也免得汇报出"无可领取项"这种假的安心话
+        out.set("growth", "网络不可达或时间预算耗尽，成长中心跳过")
+        out.set("growth_result", result)
+        return new Daily(code = a.code, quiet = false, out = out)
+    }
+    if result == "NO_SESSION" or result == "AUTH_REJECTED" or result == "FORBIDDEN" {
+        out.set("growth", "认证或权限检查未通过，成长中心跳过")
+        out.set("growth_result", result)
+        return new Daily(code = a.code, quiet = false, out = out)
+    }
+    var gout = {}
+    try {
+        gout = growth.run_growth(c, endpoint)
+    } catch e {
+        gout = {"result": "ERROR", "report": "成长中心异常（" + core.clip(_str(e.msg), 200) + "）", "_code": 1}
+    }
+    out.set("growth", jsons.get_str(gout, "report", ""))
+    out.set("growth_result", jsons.get_str(gout, "result", ""))
+    // 顺带跑成长中心；它出任何问题都不能吞掉"签到已成功"这个事实
+    var gained = core.as_int(core.dig(gout, "credits_gained"), 0)
+    var gcode = core.as_int(core.dig(gout, "_code"), 0)
+    if gained != 0 or gcode != 0 {
+        out.set("report", jsons.get_str(out, "report", "") + "；" + jsons.get_str(gout, "report", ""))
+    }
+    var code = a.code
+    if gcode != 0 and code == 0 { code = 1 }
+    out.set("needs_attention", code != 0)
+    var quiet = (result == "ALREADY" or result == "INACTIVE") and core.as_bool(core.dig(gout, "idle"))
+    return new Daily(code = code, quiet = quiet, out = out)
+}
+
+// ==================== 调试命令：原样输出服务端返回 ====================
+func debug_status(HttpClient c, string endpoint): int {
+    var r = checkin.fetch_status(c, endpoint)
+    if core.is_auth_code(r.code) {
+        var out = auth.http_auth_failure(r.code)
+        out.set("step", "status")
+        core.emit(out, "status")
+        return 1
+    }
+    var body_ok = r.code >= 200 and r.code < 300
+    core.emit({"step": "status", "http": r.code, "body": r.body, "needs_attention": not body_ok}, "status")
+    if body_ok { return 0 }
+    return 1
+}
+
+func debug_claim(HttpClient c, string endpoint): int {
+    var r = core.post(c, endpoint + "/v2/billing/meter/daily-checkin", "", true)
+    if core.is_auth_code(r.code) {
+        var out = auth.http_auth_failure(r.code)
+        out.set("step", "claim")
+        core.emit(out, "claim")
+        return 1
+    }
+    var success = (r.code >= 200 and r.code < 300) or (r.code == 400 and checkin.is_already_checked_in(r.body))
+    core.emit({"step": "claim", "http": r.code, "body": r.body, "needs_attention": not success}, "claim")
+    if success { return 0 }
+    return 1
+}
+
+func debug_growth(HttpClient c, string endpoint): int {
+    var out = growth.run_growth(c, endpoint)
+    var code = core.as_int(core.dig(out, "_code"), 0)
+    out.set("needs_attention", code != 0)
+    core.emit(public_out(out), "growth")
+    return code
+}
+
+// ==================== 入口 ====================
+main() {
+    var args = _args()
+    var action = "auto"
+    if args.len() > 0 { action = args[0] }
+    // 预算时钟**第一件事**就启动：任何后续失败都要保证还有时间把结果写出去
+    core.start_budget(action)
+
+    if not auth.in_list(KNOWN_ACTIONS, action) {
+        core.emit({"result": "ERROR",
+                   "report": "未知命令：" + action + "（可用：" + strings.join(KNOWN_ACTIONS, " / ") + "）"}, action)
+        _exit(2)
+    }
+
+    // ---- 定位凭据 ----
+    var found = auth.find_auth_file()
+    var path = found[0]
+    if path == "" {
+        var override = _env_or("WORKBUDDY_AUTH_FILE", "")
+        var report = ""
+        if override != "" {
+            report = "WORKBUDDY_AUTH_FILE 指向的文件不存在：" + override
+        } else {
+            report = "未找到 WorkBuddy 登录凭据。请先在本机登录 WorkBuddy 桌面端；或设置环境变量 WORKBUDDY_AUTH_FILE 指向 workbuddy-desktop.info。"
+        }
+        var looked = []
+        var i = 1
+        while i < found.len() {
+            looked.add(found[i])
+            i = i + 1
+        }
+        core.emit({"result": "NO_AUTH", "report": report, "looked_in": looked, "needs_attention": true}, action)
+        _exit(2)
+    }
+
+    // ---- 读取 + 解析（两条错误分开报：文件读不到 ≠ JSON 坏了）----
+    var text = ""
+    try {
+        text = auth.read_text(path)
+    } catch e {
+        // 无窗口运行下任何未捕获异常都会让当天的失败无痕消失 ⇒ 这里必须落地
+        core.emit({"result": "ERROR", "report": "读取登录凭据失败（文件被占用或缺权限），请重新登录 WorkBuddy 桌面端"},
+                  action)
+        _exit(2)
+    }
+    var decoded = null
+    try { decoded = jsons.decode(text) } catch e { decoded = null }
+    var session = decoded as Dict[string, any]
+    if session == null {
+        core.emit({"result": "ERROR", "report": "登录凭据文件不是合法 JSON（或内容损坏），请重新登录 WorkBuddy 桌面端"}, action)
+        _exit(2)
+    }
+
+    // ---- doctor：离线自检（不解密、不联网）----
+    if action == "doctor" {
+        var report = {}
+        try {
+            report = auth.doctor_report(session)
+        } catch e {
+            report = from_reason(_str(e.msg))
+        }
+        core.emit(report, action)
+        var result = jsons.get_str(report, "result", "")
+        if result == "AUTH_READY" { _exit(0) }
+        if result == "ERROR" { _exit(2) }
+        _exit(1)
+    }
+
+    // ---- 校验 → 取 token → 建客户端 ----
+    var reason = auth.validate_session(session)
+    if reason != "" {
+        core.emit(auth.auth_failure(reason), action)
+        _exit(1)
+    }
+    var token = ""
+    try {
+        token = auth.resolve_token(session, path)
+    } catch e {
+        var rep = from_reason(_str(e.msg))
+        core.emit(rep, action)
+        if jsons.get_str(rep, "result", "") == "ERROR" { _exit(2) }
+        _exit(1)
+    }
+    var headers = []
+    try {
+        headers = auth.build_headers(session, token)
+    } catch e {
+        core.emit(auth.auth_failure("INVALID_FORMAT"), action)
+        _exit(1)
+    }
+    var endpoint = auth.endpoint_of(session)
+    var c = core.new_client(core.REQUEST_TIMEOUT * 1000)
+    c.replaceHeaders(headers)
+
+    // ---- 分发 ----
+    if auth.in_list(SIMPLE_ACTIONS, action) {
+        var d = run_daily(c, endpoint)
+        core.emit(public_out(d.out), action)
+        _exit(d.code)
+    }
+
+    if auth.in_list(POLL_ACTIONS, action) {
+        var d2 = run_daily(c, endpoint)
+        d2.out.set("trigger", "poll")
+        // 空跑默认不落盘 —— 一天要跑好几轮，全写进去只会把真正有价值的记录
+        // 淹没在一串"Buddy 旅行中"里。要看完整过程就设 WORKBUDDY_GROWTH_LOG_EMPTY=1。
+        if (not d2.quiet) or core.env_flag("WORKBUDDY_GROWTH_LOG_EMPTY") {
+            core.emit(public_out(d2.out), action)
+        }
+        _exit(d2.code)
+    }
+
+    if action == "growth" {
+        _exit(debug_growth(c, endpoint))
+    }
+
+    var code = 0
+    if action == "status" or action == "all" {
+        var sc = debug_status(c, endpoint)
+        if sc != 0 { code = sc }
+        if action == "status" { _exit(code) }
+    }
+    if action == "claim" or action == "all" {
+        var cc = debug_claim(c, endpoint)
+        if cc != 0 { code = cc }
+    }
+    _exit(code)
+}

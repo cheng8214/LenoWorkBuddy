@@ -1,0 +1,12 @@
+{
+  "auth": {
+    "accessToken": {
+      "$wbEncrypted": 1,
+      "envelope": "eyJzdWl0ZSI6MSwia2V5SWQiOiIwMDAwMDAwMDAwMDAwMDAwIiwibm9uY2UiOiJBQUFBQUFBQUFBQUFBQUFBIiwiYXV0aFRhZyI6IkFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBPSIsImNpcGhlcnRleHQiOiJBQUFBIn0="
+    },
+    "domain": "www.workbuddy.cn"
+  },
+  "account": {
+    "uid": "11111111-2222-3333-4444-555555555555"
+  }
+}
