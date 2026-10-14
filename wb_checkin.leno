@@ -9,6 +9,7 @@
 // ERROR / AUTH_REJECTED / FORBIDDEN。
 import jsons
 import strings
+import times
 import "wb_core.leno" as core
 import "wb_auth.leno" as auth
 use core.(HttpClient, ApiResp)
@@ -54,7 +55,10 @@ export func already_report(Dict[string, any] status, string via): Dict[string, a
     }
 }
 
-// 领取接口返回是否表示"今日已签"（兼容 null 正文与 HTTP 400 + code 10001）
+// 领取接口返回是否**自称**"今日已签"（兼容 null 正文与 HTTP 400 + code 10001）
+//
+// ⚠ 这只是"服务端这么说"，**不是**成功依据：null 正文与 10001 都可能出现在它
+//    压根没发积分的时候。要断言"签上了"必须走 confirm_status（见 run_auto）。
 export func is_already_checked_in(Dict[string, any] body): bool {
     var raw = jsons.get_str(body, "raw", "")
     if raw != "" and raw.trim() == "null" { return true }        // 正文就是 null ⇒ 服务端语义 = 已签
@@ -108,7 +112,16 @@ export func run_auto(HttpClient c, string endpoint): RunOut {
         return new RunOut(code = 0, out = {"result": "INACTIVE", "report": rep, "active": false})
     }
     if core.as_bool(core.dig(status, "today_checked_in")) {
-        return new RunOut(code = 0, out = already_report(status, ""))
+        var rep = already_report(status, "")
+        // 服务端说"已签"，但它的签到记录里根本没有本地今天 ⇒ 大概率是它那边还没跨天重置
+        //（缓存 / 日切点与本地不一致）。这时**不能**对用户说"已经签好了"：他正是照这句
+        // 去客户端一看啥都没有，才回来报的。如实提示核实，别让人再空跑一天。
+        if today_missing_in_dates(status) {
+            rep.set("report", "服务端说今日已签，但它返回的签到记录里没有本地今天（" + local_today()
+                + "）—— 很可能是服务端还没跨天重置，请到客户端核实")
+            rep.set("needs_attention", true)
+        }
+        return new RunOut(code = 0, out = rep)
     }
 
     var cl = claim_credit(c, endpoint)
@@ -123,18 +136,43 @@ export func run_auto(HttpClient c, string endpoint): RunOut {
         return new RunOut(code = 1, out = auth.http_auth_failure(cl.code))
     }
 
-    if is_already_checked_in(cl.body) {
-        var fresh = refresh_or(status, c, endpoint)
-        return new RunOut(code = 0, out = already_report(fresh, "今日已签过（服务端判定已领取）"))
-    }
-
-    var credit = core.dig(cl.body, "credit")
-    if credit != null {
-        var fresh2 = refresh_or(status, c, endpoint)
-        var streak_days = first_non_null(core.dig(fresh2, "streak_days"), core.dig(status, "streak_days"))
-        var total_credits = core.dig(fresh2, "total_credits")
-        var is_streak_day = core.dig(fresh2, "is_streak_day")
-        var next_streak_day = core.dig(fresh2, "next_streak_day")
+    // ==================== "领取成功"一律以服务端复核为准 ====================
+    // ⚠ 踩过的坑：正文是 null 就直接当"已签"；只要响应里**出现** credit 字段就报
+    //   "成功领取 N 积分"（credit=0 也照报）。这两种都可能在服务端**压根没发**时发生
+    //   ⇒ 用户看到"成功"，去客户端一看根本没签上，白丢一天连签。
+    // 现在只有一条判据：再查一次 status，`today_checked_in == true` 才算签上；
+    // 复核不了 / 复核说没签 ⇒ 如实报 UNKNOWN（退出码 1），绝不编成功。
+    if is_already_checked_in(cl.body) or core.dig(cl.body, "credit") != null {
+        var fresh = confirm_status(c, endpoint)
+        var confirmed = fresh != null and core.as_bool(core.dig(fresh, "today_checked_in"))
+        if not confirmed {
+            // 例外：服务端给了**明确**的业务码 10001（"今天已签到，请明天再来"）—— 它是
+            // 主动声明，可以采信（并发下另一个进程刚签完就是这形态）。但复核既然对不上，
+            // 就得把这件事标出来让人知道，不能悄悄报"已签"。
+            if core.as_int(core.dig(cl.body, "code"), 0) == 10001 {
+                var body = status
+                if fresh != null { body = fresh }
+                var rep = already_report(body, "今日已签过（服务端判定已领取）")
+                rep.set("report", jsons.get_str(rep, "report", "")
+                    + "；⚠ 复核显示今日未签到，请到客户端核实")
+                rep.set("needs_attention", true)
+                return new RunOut(code = 0, out = rep)
+            }
+            var why = "领取响应看似成功，但复核显示今日仍未签到（服务端没记上），请到客户端核实或稍后重试"
+            if fresh == null {
+                why = "领取响应看似成功，但复核签到状态失败，无法确认今日是否签上，请到客户端核实"
+            }
+            return new RunOut(code = 1, out = unconfirmed(cl, why))
+        }
+        var credit = core.dig(cl.body, "credit")
+        if credit == null or core.as_int(credit, 0) <= 0 {
+            // 复核确认签上了、但响应里没有可用于展示的新增积分 ⇒ 按"已签"汇报，不编数字
+            return new RunOut(code = 0, out = already_report(fresh, "今日已签过（服务端判定已领取）"))
+        }
+        var streak_days = core.dig(fresh, "streak_days")
+        var total_credits = core.dig(fresh, "total_credits")
+        var is_streak_day = core.dig(fresh, "is_streak_day")
+        var next_streak_day = core.dig(fresh, "next_streak_day")
         var bonus = ""
         if core.as_bool(is_streak_day) { bonus = "，且为连签奖励日" }
         var cum = ""
@@ -166,11 +204,40 @@ export func run_auto(HttpClient c, string endpoint): RunOut {
         "report": "未识别的领取返回，请检查接口：" + shown, "claim_body": cl.body})
 }
 
-// 领取后重新查一次状态（拿最新连签/累计）。失败 ⇒ 用旧状态兜底，绝不因此把"领到了"说成失败
-func refresh_or(Dict[string, any] fallback, HttpClient c, string endpoint): Dict[string, any] {
+// 领取后**复核**：重查一次状态，拿到就当"服务端对今天的官方说法"，拿不到返回 null。
+//
+// ⚠ 这里特意**不**用旧状态兜底：旧的 today_checked_in 是领取前的，拿它顶替会让
+//   "服务端到底记没记上"永远为真 —— 那正是假成功的来源。
+func confirm_status(HttpClient c, string endpoint): Dict[string, any] {
     var r = fetch_status(c, endpoint)
     if ok_code(r.code) { return r.body }
-    return fallback
+    return null
+}
+
+// "看似成功、但没被服务端确认"的统一输出：退出码 1 + UNKNOWN（emit 会据此补 needs_attention）
+func unconfirmed(ApiResp cl, string why): Dict[string, any] {
+    return {"result": "UNKNOWN", "http": cl.code, "report": why, "claim_body": cl.body}
+}
+
+func local_today(): string {
+    return times.format(times.now(), "%Y-%m-%d")
+}
+
+// 服务端说"今天已签"，但签到记录列表里没有本地今天 ⇒ 状态与本地日期对不上。
+// 列表缺失/为空时**不**判定（服务端改版少个字段不该把正常流程带偏）。
+func today_missing_in_dates(Dict[string, any] status): bool {
+    var raw = core.dig(status, "checkin_dates")
+    if raw is Array => a {
+        if a.len() == 0 { return false }
+        var today = local_today()
+        for a to d {
+            if d is string => s {
+                if s == today { return false }
+            }
+        }
+        return true
+    }
+    return false
 }
 
 func part_in_parens(string detail): string {

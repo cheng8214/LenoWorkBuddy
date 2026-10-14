@@ -96,13 +96,33 @@ func route(Stub s, string method, string path): Array[string] {
             s.checked_in = true
             return ["200", status_body(s)]
         }
+        // 说"今天已签"，但签到记录里只有一堆旧日期（本地今天不在其中）⇒ 状态与本地日期对不上
+        if s.mode == "stale_dates" {
+            return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"active\":true,\"today_checked_in\":true,"
+                + "\"streak_days\":7,\"today_credit\":100,\"daily_credit\":100,\"total_credits\":700,"
+                + "\"checkin_dates\":[\"2020-01-01\",\"2020-01-02\"]}}"]
+        }
         return ["200", status_body(s)]
     }
     if path == "/v2/billing/meter/daily-checkin" {
         if s.mode == "claim400" {
             return ["400", "{\"code\":10001,\"msg\":\"今天已签到，请明天再来\"}"]
         }
+        // 含糊正文：既没说已签、也没发积分（服务端故障/未处理时会出现）
         if s.mode == "null_body" { return ["200", "null"] }
+        // 含糊正文，但复核确实显示今天已签（真实的幂等形态）
+        if s.mode == "null_body_signed" {
+            s.checked_in = true
+            return ["200", "null"]
+        }
+        // 声称发了 0 积分（旧实现会照报"成功领取 0 积分"）
+        if s.mode == "claim_zerocredit" {
+            return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"credit\":0}}"]
+        }
+        // 声称发了 100 积分，但服务端**没记上**（复核仍是未签）—— 假成功的经典形态
+        if s.mode == "claim_unrecorded" {
+            return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"credit\":100}}"]
+        }
         s.checked_in = true
         s.claims = s.claims + 1
         return ["200", "{\"code\":0,\"msg\":\"OK\",\"data\":{\"credit\":100}}"]

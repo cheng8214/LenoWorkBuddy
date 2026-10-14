@@ -53,10 +53,36 @@ func apply_view(Label todayLbl, Label statsLbl, Label statusLbl, Label hintLbl, 
     if _c_badge != BADGE_TEXT { badge.set_text(BADGE_TEXT); _c_badge = BADGE_TEXT }
 }
 
+// 写"今日状态"时必须连日期一起写：只有带上日期，跨天后才能知道这条是不是今天的
+func set_today_status(string s) {
+    ST.today_status = s
+    ST.today_status_date = auto.now_parts()[0]
+}
+
 func refresh_today() {
-    TODAY_TEXT = "今日：" + ST.today_status
-    STATS_TEXT = "连签 " + ST.streak + " 天　累计 " + ST.total + " 积分　能量 " + ST.energy
-    BADGE_TEXT = ST.today_status
+    if auto.status_is_today(ST) {
+        TODAY_TEXT = "今日：" + ST.today_status
+        STATS_TEXT = "连签 " + ST.streak + " 天　累计 " + ST.total + " 积分　能量 " + ST.energy
+        BADGE_TEXT = ST.today_status
+        return
+    }
+    // 跨天了（或压根没查过）：**不许**拿昨天那句"已签到"冒充今天 —— 用户正是照它以为
+    // 签好了，去客户端一看啥都没有。旧记录一律降级成"上次记录"，徽标回到"待查询"。
+    var stale = ST.today_status
+    if stale != "" and stale != "未知" {
+        var when = "上次"
+        if ST.today_status_date != "" { when = "上次 " + ST.today_status_date }
+        TODAY_TEXT = "今日：待查询（" + when + "：" + stale + "）"
+        if ST.streak != "—" or ST.total != "—" or ST.energy != "—" {
+            STATS_TEXT = when + "：连签 " + ST.streak + " 天　累计 " + ST.total + " 积分　能量 " + ST.energy
+        } else {
+            STATS_TEXT = "连签 —　累计 —　能量 —"
+        }
+    } else {
+        TODAY_TEXT = "今日：待查询"
+        STATS_TEXT = "连签 —　累计 —　能量 —"
+    }
+    BADGE_TEXT = "待查询"
 }
 
 func refresh_hints() {
@@ -84,7 +110,7 @@ func open_conn(): auth.Conn {
 
 func do_status() {
     if NO_NET {
-        ST.today_status = "离线"
+        set_today_status("离线")
         STATUS_TEXT = "离线模式（WORKBUDDY_GUI_NO_NET=1）：未查询接口"
         refresh_today()
         return
@@ -95,19 +121,19 @@ func do_status() {
     if cl == null { note_result("内部错误：连接已失效"); return }
     var r = checkin.fetch_status(cl, c.endpoint)
     if r.code == core.CODE_NO_NETWORK {
-        ST.today_status = "网络不可达"
+        set_today_status("网络不可达")
         note_result("网络不可达：" + jsons.get_str(r.body, "error", "请检查网络"))
         refresh_today()
         return
     }
     if core.is_auth_code(r.code) {
-        ST.today_status = "凭据被拒"
+        set_today_status("凭据被拒")
         note_result(jsons.get_str(auth.http_auth_failure(r.code), "report", core.http_label(r.code)))
         refresh_today()
         return
     }
     if not (r.code >= 200 and r.code < 300) {
-        ST.today_status = "HTTP " + _str(r.code)
+        set_today_status("HTTP " + _str(r.code))
         note_result("查状态失败（HTTP " + _str(r.code) + "）")
         refresh_today()
         return
@@ -116,14 +142,14 @@ func do_status() {
     var checked = core.as_bool(core.dig(r.body, "today_checked_in"))
     if active is bool => b {
         if not b {
-            ST.today_status = "非签到季"
+            set_today_status("非签到季")
         } else if checked {
-            ST.today_status = "已签到"
+            set_today_status("已签到")
         } else {
-            ST.today_status = "未签到"
+            set_today_status("未签到")
         }
     } else {
-        ST.today_status = if checked then "已签到" else "未签到"
+        set_today_status(if checked then "已签到" else "未签到")
     }
     var streak = core.dig(r.body, "streak_days")
     if streak != null { ST.streak = core.fmt_credit(streak) }
@@ -151,16 +177,20 @@ func do_signin() {
     if cl == null { note_result("内部错误：连接已失效"); return }
     STATUS_TEXT = "签到中…"
     var a = checkin.run_auto(cl, c.endpoint)
-    ST.today_status = ""
-    var result = jsons.get_str(a.out, "result", "")
-    if result == "CLAIMED" { ST.today_status = "已签到" }
-    if result == "ALREADY" { ST.today_status = "已签到" }
-    if result == "INACTIVE" { ST.today_status = "非签到季" }
-    if result == "NETWORK" or result == "TIMEOUT" { ST.today_status = "网络不可达" }
-    if result == "" { ST.today_status = "未知" }
-    var report = jsons.get_str(a.out, "report", "")
+    // 先落到"未知"：下面只有明确结论才改写它（"未知"≠"已签到"，跨天不会被当成签好了）
     var today = auto.now_parts()[0]
-    if ST.today_status == "已签到" { ST.signed_date = today }
+    set_today_status("未知")
+    var result = jsons.get_str(a.out, "result", "")
+    if result == "CLAIMED" { set_today_status("已签到") }
+    if result == "ALREADY" { set_today_status("已签到") }
+    if result == "INACTIVE" { set_today_status("非签到季") }
+    if result == "NETWORK" or result == "TIMEOUT" { set_today_status("网络不可达") }
+    var report = jsons.get_str(a.out, "report", "")
+    // 只有**服务端确认过**才记"今天已自动签过"。若标了 needs_attention（例如服务端说已签、
+    // 但它的签到记录里没有今天），当天就别再拿这句当挡箭牌 —— 留着重试的机会。
+    if ST.today_status == "已签到" and not core.as_bool(core.dig(a.out, "needs_attention")) {
+        ST.signed_date = today
+    }
     // 签到响应里本身就带连签/累计 ⇒ 顺手填上，不必为"显示好看"再打一次查询接口
     var sd = core.dig(a.out, "streak_days")
     if sd != null { ST.streak = core.fmt_credit(sd) }
@@ -263,8 +293,19 @@ func sf_run() {
     sf_ck(auto.parse_hhmm("24:00") < 0, "非法时间 24:00 被拒")
     sf_ck(auto.parse_hhmm("0:05") < 0, "非法时间 0:05 被拒")
     do_status()
-    sf_ck(ST.today_status != "未知" or NO_NET, "查状态后今日状态不再是未知（" + ST.today_status + "）")
+    sf_ck(auto.status_is_today(ST), "查状态后今日状态已刷新到今天（" + ST.today_status + "）")
     sf_ck(STATUS_TEXT != "就绪", "状态行已更新")
+    // 跨天旧值：昨天写下的"已签到"**不许**在顶部冒充今天（用户正是照它以为签好了、去客户端一看啥都没有）
+    var keep_status = ST.today_status
+    var keep_date = ST.today_status_date
+    ST.today_status = "已签到"
+    ST.today_status_date = "2020-01-01"
+    refresh_today()
+    sf_ck(strings.starts_with(TODAY_TEXT, "今日：待查询"), "昨天的已签到不冒充今天（" + TODAY_TEXT + "）")
+    sf_ck(BADGE_TEXT == "待查询", "跨天徽标回到待查询")
+    ST.today_status = keep_status
+    ST.today_status_date = keep_date
+    refresh_today()
     var before = ST.signed_date
     CFG.signin_at = "00:00"
     CFG.signin_on = true
@@ -307,8 +348,7 @@ main() {
 
     var win = SDL3.createWindow({title:"WorkBuddy 签到助手", w:660, h:620, resizable:false})
     if not win.ok {
-        print("[gui] 窗口创建失败\n")
-        _exit(1)
+        _exit(1)                       // 窗口建不起来就没得玩；GUI 侧没有控制台，打印也没人看
     }
     SDL3.ttfInit()
 
@@ -435,10 +475,7 @@ main() {
     var trayOk = false
     if not AUTO_SELFTEST {
         trayOk = tray.tray_init(win, func():void { do_signin(); refresh_hints() })
-        if startHidden and trayOk {
-            tray.tray_show(false)
-            print("[gui] --tray：启动即隐藏到托盘\n")
-        }
+        if startHidden and trayOk { tray.tray_show(false) }
     }
     if trayOk {
         var tipCache = ""
@@ -484,17 +521,11 @@ main() {
             r.clearColor(#12141AFF)
             apply_view(todayLbl, statsLbl, statusLbl, hintLbl, badge)
             FRAMES = FRAMES + 1
-            if FRAMES == 1 {
-                print("[gui] 首帧渲染 ok　" + TODAY_TEXT + "　" + STATUS_TEXT + "\n")
-            }
             if AUTO_FRAMES > 0 and FRAMES >= AUTO_FRAMES {
-                print("[gui] frames=" + _str(FRAMES) + "  " + TODAY_TEXT + "  " + STATS_TEXT
-                      + "  状态=" + STATUS_TEXT + "\n")
-                _exit(if _sfFail > 0 then 1 else 0)
+                _exit(if _sfFail > 0 then 1 else 0)      // 冒烟：跑到帧数上限即退出，结论看退出码
             }
         }
     )
-    print("[gui] 主循环退出　frames=" + _str(FRAMES) + "　状态=" + STATUS_TEXT + "\n")
     if trayOk { tray.tray_shutdown() }
     SDL3.ttfQuit()
 }

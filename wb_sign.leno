@@ -87,8 +87,12 @@ func run_daily(HttpClient c, string endpoint): Daily {
     }
     var code = a.code
     if gcode != 0 and code == 0 { code = 1 }
-    out.set("needs_attention", code != 0)
-    var quiet = (result == "ALREADY" or result == "INACTIVE") and core.as_bool(core.dig(gout, "idle"))
+    // ⚠ 这里是"合并"不是覆盖：checkin 可能已经标了 needs_attention（如服务端说已签、但
+    //   签到记录里没有今天）。覆盖成 false 等于把那条告警吞掉，轮询还会当空跑静默不落盘。
+    var attention = code != 0 or core.as_bool(out.get("needs_attention"))
+    out.set("needs_attention", attention)
+    var quiet = (not attention) and (result == "ALREADY" or result == "INACTIVE")
+                and core.as_bool(core.dig(gout, "idle"))
     return new Daily(code = code, quiet = quiet, out = out)
 }
 

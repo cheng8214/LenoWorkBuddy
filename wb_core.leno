@@ -56,18 +56,18 @@ struct Budget {
 
 // 解析预算环境变量。非法值/越界值一律夹到安全区间 —— **绝不能在这里抛异常**：
 // 这个坑踩过：异常会在 main 的 try/except 生效之前把进程打崩，silent 模式下当天日志整条为空
-export func parse_budget(float def, float maximum): Budget {
+export func parse_budget(float fallback, float maximum): Budget {
     var raw = _env_or("WORKBUDDY_BUDGET_SECONDS", "")
-    if raw == "" { return new Budget(seconds = def, warning = "") }
+    if raw == "" { return new Budget(seconds = fallback, warning = "") }
     var parsed = try_float(raw)
     if not parsed.ok {
-        return new Budget(seconds = def,
-            warning = "WORKBUDDY_BUDGET_SECONDS=" + raw + " 不是数字，已回落 " + _str(_int(def)) + " 秒")
+        return new Budget(seconds = fallback,
+            warning = "WORKBUDDY_BUDGET_SECONDS=" + raw + " 不是数字，已回落 " + _str(_int(fallback)) + " 秒")
     }
     if parsed.value <= 0.0 {
         // "0" 是非空字符串，用 `or` 兜不住；且 0 会让每个请求都直接放弃，脚本永久失效
-        return new Budget(seconds = def,
-            warning = "WORKBUDDY_BUDGET_SECONDS=" + raw + " 必须为正数，已回落 " + _str(_int(def)) + " 秒")
+        return new Budget(seconds = fallback,
+            warning = "WORKBUDDY_BUDGET_SECONDS=" + raw + " 必须为正数，已回落 " + _str(_int(fallback)) + " 秒")
     }
     if parsed.value > maximum {
         // 上限同样是硬要求：预算大于任务时限就等于没有预算，黑洞式超时会把进程跑到被强杀
@@ -81,13 +81,13 @@ export func parse_budget(float def, float maximum): Budget {
 // 轮询类命令（silent-poll / silent-growth）预算更短、上限更低
 export func start_budget(string action) {
     var poll = action == "silent-poll" or action == "silent-growth"
-    var def = DEFAULT_BUDGET_SECONDS
+    var fallback = DEFAULT_BUDGET_SECONDS
     var maximum = MAX_BUDGET_SECONDS
     if poll {
-        def = POLL_BUDGET_SECONDS
+        fallback = POLL_BUDGET_SECONDS
         maximum = POLL_MAX_BUDGET_SECONDS
     }
-    var b = parse_budget(def, maximum)
+    var b = parse_budget(fallback, maximum)
     _budget_seconds = b.seconds
     _config_warning = b.warning
     _started_ms = times.ms()
@@ -253,8 +253,8 @@ func is_int_str(string t): bool {
     return true
 }
 
-export func as_int(any v, int def): int {
-    if v == null { return def }
+export func as_int(any v, int fallback): int {
+    if v == null { return fallback }
     if v is int => i { return i }
     if v is bool => b {
         if b { return 1 }
@@ -266,20 +266,20 @@ export func as_int(any v, int def): int {
         if is_int_str(t) { return _int(t) }
         var f = try_float(t)
         if f.ok { return _int(f.value) }   // 兼容 "1.5"/"1e3"：宁可截断，也不把真实数值丢成 0
-        return def
+        return fallback
     }
-    return def
+    return fallback
 }
 
-export func as_float(any v, float def): float {
-    if v == null { return def }
+export func as_float(any v, float fallback): float {
+    if v == null { return fallback }
     if v is float => f { return f }
     if v is int => i { return _float(i) }
     if v is string => s {
         var f = try_float(s)
         if f.ok { return f.value }
     }
-    return def
+    return fallback
 }
 
 export func as_bool(any v): bool {

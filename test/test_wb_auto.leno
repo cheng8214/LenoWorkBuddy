@@ -132,6 +132,18 @@ main() {
     eq_i("状态回环 分钟", s2.last_poll_min, 123)
     eq_s("状态回环 连签", s2.streak, "12")
 
+    // 跨天失效：落盘里的"已签到"**必须**带日期才算今天的。不带日期的旧文件
+    //（或日期不是今天）一律不能当成"今天已签到" —— 这正是"提示成功、去看没成功"的来源。
+    ck("无日期的旧状态不算今天", not auto.status_is_today(s2))
+    var s3 = new auto.AutoState()
+    s3.today_status = "已签到"
+    s3.today_status_date = auto.now_parts()[0]
+    ck("带今天的日期才算今天", auto.status_is_today(s3))
+    s3.today_status_date = "2026-10-14"
+    ck("昨天的日期不算今天", not auto.status_is_today(s3))
+    var s4 = auto.load_state()
+    eq_s("日期字段已落盘", s4.today_status_date, "")
+
     print("")
     print("通过 " + _str(passed) + " / 失败 " + _str(failed))
     if failed > 0 { _exit(1) }

@@ -79,26 +79,20 @@ export func tray_init(Window win, func():void on_signin): bool {
     if _env("WORKBUDDY_TRAY_SELFTEST") != null { _valName = VAL_NAME + "_selftest" }
 
     Ptr[u8] surf = SDL3.loadImage(_ip("tray_icon.png"))
-    // 图标加载失败必须说出来：createTray(null) 照样成功（SDL 不校验 icon）⇒
-    //   不打印的话，资源缺失只会表现为"托盘里没图标"，查不出原因
-    if surf == null { print("[tray] 图标加载失败：" + _ip("tray_icon.png") + "\n") }
+    // 图标加载失败不打断流程（createTray(null) 照样成功，SDL 不校验 icon），
+    //   表现只是"托盘里没图标"；真出这现象就看 images/ 有没有随包打进去
     _iconSurf = surf
     // 声明成 `Tray?`：该工厂在失败时**返回 null**，而它的静态返回类型不是可空的
     //   （LenoSDL3 的既有约定）⇒ 不加 `?` 编译器会提示"struct 与 null 比较"的假告警
     Tray? t = SDL3.createTray({icon: surf, tooltip: _tip})
-    if t == null {
-        print("[tray] 托盘创建失败 ⇒ 退化为无托盘模式（关窗即退出）\n")
-        return false
-    }
+    if t == null { return false }            // 退化为无托盘模式（关窗即退出）
     _tray = t
     _hasTray = true
-    if not SDL3.interceptTrayClick() { print("[tray] 托盘点击拦截不可用（非 Windows）⇒ 菜单不可达，请用窗口内按钮\n") }
+    // 非 Windows 上点击拦截不可用 ⇒ 托盘菜单不可达，只能用窗口内按钮（返回值这里不用管）
+    SDL3.interceptTrayClick()
 
     PopMenu? pm = SDL3.createPopMenu({font_size: 14.0})
-    if pm == null or not pm.ok() {
-        print("[tray] 自绘菜单创建失败\n")
-        return false
-    }
+    if pm == null or not pm.ok() { return false }
     _pm = pm
     _hasMenu = true
     pm.addItem("隐藏窗口", _ip("tray_icon.png"), func() { _actToggle = true })
@@ -108,8 +102,6 @@ export func tray_init(Window win, func():void on_signin): bool {
     pm.addSeparator()
     pm.addItem("退出", _ip("exit.png"), func() { _actQuit = true })
     _inited = true
-    print("[tray] 就绪：右键=菜单，左键=显示/隐藏窗口"
-          + (if autostart_on() then "（开机自启动已开）" else "") + "\n")
     return true
 }
 
@@ -163,13 +155,7 @@ export func tray_tick() {
     }
     if _actAuto {
         _actAuto = false
-        var want = not autostart_on()
-        var ok = set_autostart(want)
-        if ok {
-            print("[tray] 开机自启动已" + (if want then "开启" else "关闭") + "\n")
-        } else {
-            print("[tray] 开机自启动设置失败（" + os_name() + "：自启项不可写或本平台未实现）\n")
-        }
+        set_autostart(not autostart_on())    // 结果体现在菜单勾选上（勾选态每拍重读实际值）
     }
     if _actQuit {
         _actQuit = false

@@ -50,6 +50,15 @@ func eq_s(string name, string got, string want) {
     }
 }
 
+func lacks_text(string name, string haystack, string needle) {
+    if not haystack.has(needle) {
+        passed = passed + 1
+    } else {
+        failed = failed + 1
+        print("✗ " + name + "：不该出现「" + needle + "」\n    实际：「" + haystack + "」")
+    }
+}
+
 func has_text(string name, string haystack, string needle) {
     if haystack.has(needle) {
         passed = passed + 1
@@ -61,7 +70,13 @@ func has_text(string name, string haystack, string needle) {
 
 // 起一个 stub 进程（独立端口 ⇒ 各场景互不干扰，也避开 TIME_WAIT）
 func start_stub(string mode, int port): int {
+    return start_stub_max(mode, port, 200)
+}
+
+// max_requests：处理满这么多个请求就自行退出（用来造"复核时服务端已经不在了"）
+func start_stub_max(string mode, int port, int max_requests): int {
     _env("WB_STUB_MODE", mode)
+    _env("WB_STUB_MAX", _str(max_requests))
     return _spawn(leno_exe, "\"" + stub_path + "\" " + _str(port))
 }
 
@@ -157,14 +172,27 @@ main() {
     eq_i("⑥ 不算失败", a6.code, 0)
     _kill(h6)
 
-    // ---------- ⑦ 领取正文是 null（另一种幂等形态）----------
+    // ---------- ⑦ 领取正文是 null，复核仍显示今日未签 ⇒ **不算**成功 ----------
+    //（旧实现直接把 null 正文当"已签"，用户于是看到一句"今日已签过"，去客户端一看啥都没有）
     core.start_budget("auto")
     var h7 = start_stub("null_body", 8807)
     sleep(600)
     var c7 = new_authed(session, token, 8807)
     var a7 = checkin.run_auto(c7, endpoint(8807))
-    eq_s("⑦ null 正文按已签处理", jsons.get_str(a7.out, "result", ""), "ALREADY")
+    eq_s("⑦ null 正文未经复核不算已签", jsons.get_str(a7.out, "result", ""), "UNKNOWN")
+    eq_i("⑦ 退出码 1", a7.code, 1)
+    has_text("⑦ 提示去核实", jsons.get_str(a7.out, "report", ""), "核实")
     _kill(h7)
+
+    // ---------- ⑦b 领取正文是 null，但复核确实显示已签 ⇒ 才是 ALREADY ----------
+    core.start_budget("auto")
+    var h7b = start_stub("null_body_signed", 8817)
+    sleep(600)
+    var c7b = new_authed(session, token, 8817)
+    var a7b = checkin.run_auto(c7b, endpoint(8817))
+    eq_s("⑦b null 正文 + 复核已签", jsons.get_str(a7b.out, "result", ""), "ALREADY")
+    eq_i("⑦b 退出码 0", a7b.code, 0)
+    _kill(h7b)
 
     // ---------- ⑧ 401：凭据被拒 ----------
     core.start_budget("auto")
@@ -210,6 +238,55 @@ main() {
     var cost = times.ms() - started
     eq_s("⑪ 网络不可达", jsons.get_str(a11.out, "result", ""), "NETWORK")
     ok("⑪ 低预算下不空等重试（< 10s）", cost < 10000.0)
+
+    // ---------- ⑫ 响应声称发了 0 积分、复核仍显示未签 ⇒ 绝不报"成功领取" ----------
+    //（旧实现只要响应里**出现** credit 就报"成功领取 0 积分"，用户自然以为签上了）
+    _env("WORKBUDDY_BUDGET_SECONDS", "60")
+    core.start_budget("auto")
+    var h12 = start_stub("claim_zerocredit", 8812)
+    sleep(600)
+    var c12 = new_authed(session, token, 8812)
+    var a12 = checkin.run_auto(c12, endpoint(8812))
+    eq_s("⑫ 0 积分不算成功", jsons.get_str(a12.out, "result", ""), "UNKNOWN")
+    eq_i("⑫ 退出码 1", a12.code, 1)
+    lacks_text("⑫ 文案里不许出现成功领取", jsons.get_str(a12.out, "report", ""), "成功领取")
+    _kill(h12)
+
+    // ---------- ⑬ 响应声称发了 100 积分、但服务端没记上 ⇒ UNKNOWN ----------
+    core.start_budget("auto")
+    var h13 = start_stub("claim_unrecorded", 8813)
+    sleep(600)
+    var c13 = new_authed(session, token, 8813)
+    var a13 = checkin.run_auto(c13, endpoint(8813))
+    eq_s("⑬ 未记上不算成功", jsons.get_str(a13.out, "result", ""), "UNKNOWN")
+    eq_i("⑬ 退出码 1", a13.code, 1)
+    has_text("⑬ 提示去核实", jsons.get_str(a13.out, "report", ""), "核实")
+    _kill(h13)
+
+    // ---------- ⑭ 服务端说已签、但签到记录里没有本地今天 ⇒ 提示核实（不再冒充"已签好了"）----------
+    core.start_budget("auto")
+    var h14 = start_stub("stale_dates", 8814)
+    sleep(600)
+    var c14 = new_authed(session, token, 8814)
+    var a14 = checkin.run_auto(c14, endpoint(8814))
+    eq_s("⑭ 结果仍按已签", jsons.get_str(a14.out, "result", ""), "ALREADY")
+    has_text("⑭ 提示记录里没有今天", jsons.get_str(a14.out, "report", ""), "没有本地今天")
+    ok("⑭ 标了 needs_attention", core.as_bool(core.dig(a14.out, "needs_attention")))
+    _kill(h14)
+
+    // ---------- ⑮ 复核时服务端已经不在了：宁可说"没法确认"，也不报成功 ----------
+    //    stub 只处理 2 个请求（status + claim）就退出 ⇒ 第 3 个（复核）连不上
+    //    低预算 ⇒ 连不上时不做分钟级退避，测试不空等
+    _env("WORKBUDDY_BUDGET_SECONDS", "20")
+    core.start_budget("auto")
+    var h15 = start_stub_max("normal", 8815, 2)
+    sleep(600)
+    var c15 = new_authed(session, token, 8815)
+    var a15 = checkin.run_auto(c15, endpoint(8815))
+    sleep(400)
+    eq_s("⑮ 复核不了就不算成功", jsons.get_str(a15.out, "result", ""), "UNKNOWN")
+    eq_i("⑮ 退出码 1", a15.code, 1)
+    _kill(h15)
 
     _env("WORKBUDDY_API_BASE", "")
     _env("WORKBUDDY_BUDGET_SECONDS", "")

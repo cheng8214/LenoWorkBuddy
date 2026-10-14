@@ -180,10 +180,15 @@ os_crypt 密钥、凭据管理器与 `HKCU\Software\Tencent` 里也没有。
 一个出口、**没有 stdin**，于是这里改成：
 
 ```
-wb_helper.js  +  环境变量协议（WB_HELPER_AUTH / WB_HELPER_OUT / WB_HELPER_OP）
+助手源码**内嵌**在 wb_auth.leno 里 + 环境变量协议
+（WB_HELPER_JS 传代码本体 / WB_HELPER_AUTH 凭据路径 / WB_HELPER_OUT 结果文件 / WB_HELPER_OP 探针或解密）
                      ↓  _spawn  (CreateProcessW，不经 cmd)
         WorkBuddy.exe 以 ELECTRON_RUN_AS_NODE=1 运行 → 结果落盘 → 读完即删
 ```
+
+> 助手不再是独立文件：源码内嵌成 `HELPER_JS` 原始字符串，命令行只传一句
+> `-e "eval(process.env.WB_HELPER_JS)"`（代码本体走环境变量）。这样打包时
+> **不存在"资源没带上"这个失败面** —— 单文件 exe 与脚本模式是同一份代码。
 
 顺带避开了"路径带空格时 `cmd` 引号被吞"的坑（`_spawn` 会把 exe 与参数分开传）。
 密钥只在那个短命子进程的内存里出现，随即置零；不落盘、不缓存、不回传。
@@ -200,6 +205,15 @@ wb_helper.js  +  环境变量协议（WB_HELPER_AUTH / WB_HELPER_OUT / WB_HELPER
   非法值一律夹到安全区间并附 `config_warning`，绝不因为一个坏环境变量把当天日志丢掉。
 - **"常态"不记失败**：旅行名额已用完、日期无需补登、连登档位未解锁、没有抽奖次数
   —— 这些按正常业务状态处理，否则轮询会每轮强制落盘。
+- **"成功"必须由服务端确认**：领取接口返回什么都**不算**签上了 —— 正文是 `null`、
+  或响应里带 `credit` 字段（哪怕是 0），都可能是服务端压根没发积分。唯一判据是
+  **再查一次状态**：`today_checked_in == true` 才算数（报 `CLAIMED` / `ALREADY`）。
+  复核不了、或复核说没签 ⇒ 如实报 `UNKNOWN` 并置 `needs_attention`，**绝不编成功**。
+  （例外：服务端明确回 `code 10001`"今天已签到"时采信它，但复核对不上会额外标
+  `⚠ 复核显示今日未签到，请到客户端核实`。）
+- **跨天不沿用旧值**：GUI 落盘的"今日状态"带日期（`today_status_date`）。日期不是
+  本地今天就一律显示 `今日：待查询（上次 2026-10-14：已签到）`，徽标回 `待查询`
+  —— 不再拿昨天的"已签到"冒充今天。
 
 差异（有意为之）：
 
@@ -235,12 +249,15 @@ wb_helper.js  +  环境变量协议（WB_HELPER_AUTH / WB_HELPER_OUT / WB_HELPER
 | `AUTH_ERROR / UNSUPPORTED_ENVELOPE` | 加密格式尚不支持：**重新登录不会解决**，要更新脚本 |
 | `AUTH_ERROR / RUNTIME_NOT_FOUND`、`INVALID_RUNTIME_PATH` | 用 `WORKBUDDY_EXE` 指定客户端可执行文件 |
 | `AUTH_ERROR / KEY_MISMATCH`、`DECRYPT_FAILED` | 凭据与所选客户端不是一对（多版本安装时用 `WORKBUDDY_EXE` 明确选） |
-| `AUTH_ERROR / HELPER_TIMEOUT`、`HELPER_PROTOCOL` | 凭据助手超时/返回无效结果，检查客户端和脚本版本 |
+| `AUTH_ERROR / HELPER_TIMEOUT`、`HELPER_PROTOCOL` | 凭据助手超时/返回无效结果。**先看包是不是比源码旧**：助手已内嵌进 `wb_auth.leno`，早于该改动打的 exe 还会去找独立的 `wb_helper.js` ⇒ 重新打包即可。脚本模式下可用 `doctor` 区分（它同样走助手链路，能过就说明代码没问题） |
 | `AUTH_REJECTED / HTTP 401` | 服务端拒绝认证：检查客户端登录状态、凭据对应的服务地址 |
 | `FORBIDDEN / HTTP 403` | 服务端拒绝操作，检查账号权限或活动条件（**不能**据此判断登录过期） |
 | `INACTIVE / 签到活动未开启` | 非签到季，正常 |
 | `NETWORK / 网络不可达` | 断网或服务端不可用，**非**登录问题；已按分钟级退避重试，仍失败等下一次运行 |
 | `TIMEOUT / 已达本次运行时间预算` | 已领到部分照常记录，剩余项下次再领 |
+| `UNKNOWN / 未确认`（退出码 1） | 领取请求发出去了，但服务端**没确认**（复核说未签，或复核本身失败）。这不等于签好了：去客户端看一眼，必要时再跑一次（接口幂等，多跑只是多一次查询） |
+| GUI 顶部显示`今日：待查询（上次 …）` | 正常：那行是**上次**查询的结论，跨天不再沿用。点「查状态」或等自动拍子刷新成今天 |
+| 服务端说已签、但签到记录里没有本地今天 | 文案会提示核实并置 `needs_attention`（多半是服务端还没跨天重置）。**以客户端显示为准**，别只看脚本 |
 | 00:05 那次失败但连签没断 | 正常：轮询任务会先查状态、未签就补（日志里该轮带 `"trigger":"poll"`） |
 | `signin.log` 里查不到轮询记录 | 正常：空跑不落盘，`WORKBUDDY_GROWTH_LOG_EMPTY=1` 可打开 |
 | 调试原始返回 | `leno wb_sign.leno status` |
@@ -265,11 +282,10 @@ wb_helper.js  +  环境变量协议（WB_HELPER_AUTH / WB_HELPER_OUT / WB_HELPER
 | 文件 | 职责 |
 |---|---|
 | `wb_core.leno` | 基础设施：时间预算、HTTP 重试、`dig` 信封取值、标量转换、输出与脱敏 |
-| `wb_auth.leno` | 凭据：定位、校验、两条解密路（纯 Leno / 客户端运行时）、请求头、失败原因人话化、doctor |
+| `wb_auth.leno` | 凭据：定位、校验、两条解密路（纯 Leno / 客户端运行时）、请求头、失败原因人话化、doctor；**内嵌凭据助手源码**（`HELPER_JS`，经 `WB_HELPER_JS` 交给客户端运行时） |
 | `wb_envelope.leno` | `sym-v1` 信封的**纯 Leno** 解析与解密（密钥派生、AAD 布局、AES-256-GCM），依赖 `LenoCrypto` |
 | `wb_checkin.leno` | 签到：查状态 → 未签才领 → 复取状态 → 汇报（幂等口径都在这里） |
 | `wb_growth.leno` | 成长中心七段；写操作不重试、"常态"不记失败的口径都在这里 |
-| `wb_helper.js` | 凭据助手（跑在客户端运行时里；随包资源，见 `resource.toml`） |
 | `wb_sign.leno` | CLI 入口：参数、退出码、silent 落盘、轮询空跑判据 |
 | `wb_gui.leno` | 图形界面：窗口、三张卡片、开关/输入框接线、主循环 |
 | `wb_tray.leno` | 托盘 + 自绘菜单 + 开机自启动（系统集成层） |
@@ -293,7 +309,7 @@ leno <Leno>\build\leno_module\LenoCrypto\test\test_crypto_vectors.leno
 GUI 的两个无头模式（都不需要人看屏幕，可直接进 CI）：
 
 ```bat
-:: ① 冒烟：建窗口 + 跑 N 帧后打印摘要退出（验证控件构造、主循环、渲染回调）
+:: ① 冒烟：建窗口 + 跑 N 帧后按退出码退出（验证控件构造、主循环、渲染回调；不再打印摘要）
 set SDL_VIDEODRIVER=dummy & set WORKBUDDY_GUI_AUTO=60 & set WORKBUDDY_GUI_NO_NET=1
 leno wb_gui.leno
 
@@ -302,14 +318,16 @@ set WORKBUDDY_GUI_SELFTEST=1 & leno wb_gui.leno
 ```
 
 `test\wb_stub.leno` 是一个只监听 127.0.0.1 的迷你 HTTP 服务端，用 `WB_STUB_MODE`
-切场景（`normal` / `already` / `inactive` / `claim400` / `null_body` / `unauthorized` /
-`flaky` / `server_error`），把"未签→领取""服务端判已签""401""5xx 重试""低预算不空等"
-这些**平时撞不上**的路径全跑穿。当前：单测 84 项 + 流程 41 项，全绿。
+切场景（`normal` / `already` / `stale_dates` / `inactive` / `claim400` / `null_body` /
+`null_body_signed` / `claim_zerocredit` / `claim_unrecorded` / `unauthorized` / `flaky` /
+`server_error`），把"未签→领取""服务端判已签""**看起来成功但服务端没记上**""401"
+"5xx 重试""低预算不空等"这些**平时撞不上**的路径全跑穿。
+当前：单测 86 项 + 流程 56 项 + 信封 9 项 + 定时/落盘 42 项 + GUI 自检 11 项，全绿。
 
 ### 打包
 
 ```bat
-leno -p wb_sign.leno -o dist            :: 单文件（内嵌 libcurl + wb_helper.js）
+leno -p wb_sign.leno -o dist            :: 单文件（内嵌 libcurl + images/；助手源码本就在代码里）
 leno -p wb_sign.leno -o dist --no-console  :: 再免掉控制台窗口（定时任务用）
 ```
 

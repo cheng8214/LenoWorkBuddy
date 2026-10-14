@@ -32,6 +32,9 @@ export struct AutoState {
     string last_text = ""            // 最近一次动作的汇报文案
     string last_at = ""              // 最近一次动作的时间
     string today_status = "未知"      // 今日签到状态（显示用）
+    // ⚠ 上一条是**哪天**的状态。没有它就会出这种事故：昨天写进"已签到"，今天开程序
+    //   顶部照旧显示"今日：已签到"，用户以为签好了，去客户端一看根本没签上。
+    string today_status_date = ""
     string streak = "—"
     string total = "—"
     string energy = "—"
@@ -93,25 +96,25 @@ export func save_cfg(AutoCfg c): bool {
     }
 }
 
-func read_bool(Dict[string, any] m, string k, bool def): bool {
+func read_bool(Dict[string, any] m, string k, bool fallback): bool {
     var v = m.get(k)
     if v is bool => b { return b }
-    return def
+    return fallback
 }
 
-func read_int(Dict[string, any] m, string k, int def): int {
+func read_int(Dict[string, any] m, string k, int fallback): int {
     var v = m.get(k)
     if v is int => i { return i }
-    return def
+    return fallback
 }
 
 // 时间字段必须是合法 HH:MM —— 存进去就一定是合法的（下面 parse_hhmm 是唯一校验口径）
-func read_time(Dict[string, any] m, string k, string def): string {
+func read_time(Dict[string, any] m, string k, string fallback): string {
     var v = m.get(k)
     if v is string => s {
         if parse_hhmm(s) >= 0 { return s }
     }
-    return def
+    return fallback
 }
 
 // ==================== 时间小工具 ====================
@@ -210,10 +213,18 @@ export func load_state(): AutoState {
     out.last_text = jsons.get_str(m, "last_text", "")
     out.last_at = jsons.get_str(m, "last_at", "")
     out.today_status = jsons.get_str(m, "today_status", "未知")
+    out.today_status_date = jsons.get_str(m, "today_status_date", "")
     out.streak = jsons.get_str(m, "streak", "—")
     out.total = jsons.get_str(m, "total", "—")
     out.energy = jsons.get_str(m, "energy", "—")
     return out
+}
+
+// 落盘里的"今日状态"是不是**今天**的？旧文件（没这个字段）一律算不是 —— 宁可显示"待查询"，
+// 也不能拿昨天的"已签到"冒充今天。
+export func status_is_today(AutoState s): bool {
+    if s.today_status_date == "" { return false }
+    return s.today_status_date == now_parts()[0]
 }
 
 export func save_state(AutoState s): bool {
@@ -224,6 +235,7 @@ export func save_state(AutoState s): bool {
         "last_text": s.last_text,
         "last_at": s.last_at,
         "today_status": s.today_status,
+        "today_status_date": s.today_status_date,
         "streak": s.streak,
         "total": s.total,
         "energy": s.energy
