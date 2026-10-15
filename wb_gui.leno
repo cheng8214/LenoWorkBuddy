@@ -115,6 +115,9 @@ func do_status() {
         refresh_today()
         return
     }
+    // 点下去**立刻**给个中间态：解凭据要拉起客户端、冷启动几百毫秒到几秒，
+    // 不反馈的话用户看到的就是"点了没反应"（然后以为按钮坏了）
+    STATUS_TEXT = "查状态中…"
     var c = open_conn()
     if not c.ok { return }
     var cl = c.client

@@ -10,6 +10,7 @@ import strings
 import files
 import dirs
 import times
+import Sys
 import "web_net" as net
 use net.(HttpClient, Response)
 
@@ -41,6 +42,26 @@ var ENVELOPES = ["data", "result", "resp", "response"]
 // 需要人关注的结果码（emit 据此补 needs_attention）
 var ATTENTION_RESULTS = ["ERROR", "UNKNOWN", "NETWORK", "TIMEOUT", "NO_AUTH", "NO_SESSION",
                          "AUTH_ERROR", "AUTH_REJECTED", "FORBIDDEN"]
+
+// ==================== 数据目录（唯一事实来源）====================
+// 配置、状态、多账户凭据都落在同一个根下 ⇒ 只有这一处决定"数据放哪"。
+// 优先 WORKBUDDY_DATA_DIR（测试钩子：自检/回归把数据关进临时目录，绝不碰真实文件）；
+// 否则系统配置目录（Windows = %APPDATA%）；都取不到就退回脚本目录
+// —— "可写但难看"优于"写不进去"（打包放 Program Files 时尤其重要）✓
+export var APP_DIR = "LenoWorkBuddy"
+
+export func data_root(): string {
+    var override = _env_or("WORKBUDDY_DATA_DIR", "").trim()
+    var base = override
+    if base == "" {
+        try { base = Sys.configDir() } catch e { base = "" }
+    }
+    if base == "" { base = dirs.script_dir() }
+    var root = base
+    if override == "" { root = dirs.join(base, APP_DIR) }   // 测试钩子给的就是最终目录本身
+    try { dirs.mkdir_p(root) } catch e { var _mkdir_failed = true }
+    return root
+}
 
 // ==================== ① 时间预算 ====================
 // 为什么不用 `times.now()`（挂钟）：挂钟会被 NTP 校时、夏令时往回拨 ⇒ 预算算出负数或虚高。

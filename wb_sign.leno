@@ -10,18 +10,26 @@
 //   leno wb_sign.leno claim          # 仅领取签到（调试，幂等）
 //   leno wb_sign.leno all            # 查签到状态 + 领取（调试）
 //   leno wb_sign.leno doctor         # 离线检查凭据格式与运行时能力，不解密、不联网
+//   leno wb_sign.leno accounts       # 列出已归档账号（不联网）
+//
+// 多账户：
+//   `--account <uid>` 只跑指定账号（例：`auto --account 123456`），省略则**逐个跑全部账号**。
+//   账号从哪来：每次运行都会把**当前登录**账号的凭据归档一份（客户端切号/登出后就拿不到了）
+//   ⇒ 在客户端每登录一个账号，它就自动进列表一次，之后切来切去都不影响签到 ✓
 //
 // 退出码：0 成功（含"今日已签"与"非签到季"）／1 认证·网络·需要关注的失败／2 用法与环境错误。
+//   多账户下取**最差**的那个（任一账号失败 ⇒ 整体 1），免得一个坏账号被另一个的好结果盖住。
 import jsons
 import strings
 import "wb_core.leno" as core
 import "wb_auth.leno" as auth
+import "wb_auto.leno" as auto
 import "wb_checkin.leno" as checkin
 import "wb_growth.leno" as growth
 use core.(HttpClient, ApiResp)
 
 var KNOWN_ACTIONS = ["auto", "silent", "growth", "silent-poll", "silent-growth",
-                     "status", "claim", "all", "doctor"]
+                     "status", "claim", "all", "doctor", "accounts"]
 var SIMPLE_ACTIONS = ["auto", "silent"]
 var POLL_ACTIONS = ["silent-poll", "silent-growth"]
 
@@ -97,47 +105,167 @@ func run_daily(HttpClient c, string endpoint): Daily {
 }
 
 // ==================== 调试命令：原样输出服务端返回 ====================
-func debug_status(HttpClient c, string endpoint): int {
+// 这两支只**构造结果**、不自己输出：多账户下由 run_one 统一补 account 字段再 emit
+func debug_status(HttpClient c, string endpoint): Dict[string, any] {
     var r = checkin.fetch_status(c, endpoint)
     if core.is_auth_code(r.code) {
         var out = auth.http_auth_failure(r.code)
         out.set("step", "status")
-        core.emit(out, "status")
-        return 1
+        return out
     }
     var body_ok = r.code >= 200 and r.code < 300
-    core.emit({"step": "status", "http": r.code, "body": r.body, "needs_attention": not body_ok}, "status")
-    if body_ok { return 0 }
-    return 1
+    return {"step": "status", "http": r.code, "body": r.body, "needs_attention": not body_ok}
 }
 
-func debug_claim(HttpClient c, string endpoint): int {
+func debug_claim(HttpClient c, string endpoint): Dict[string, any] {
     var r = core.post(c, endpoint + "/v2/billing/meter/daily-checkin", "", true)
     if core.is_auth_code(r.code) {
         var out = auth.http_auth_failure(r.code)
         out.set("step", "claim")
-        core.emit(out, "claim")
-        return 1
+        return out
     }
     var success = (r.code >= 200 and r.code < 300) or (r.code == 400 and checkin.is_already_checked_in(r.body))
-    core.emit({"step": "claim", "http": r.code, "body": r.body, "needs_attention": not success}, "claim")
-    if success { return 0 }
-    return 1
+    return {"step": "claim", "http": r.code, "body": r.body, "needs_attention": not success}
 }
 
-func debug_growth(HttpClient c, string endpoint): int {
-    var out = growth.run_growth(c, endpoint)
-    var code = core.as_int(core.dig(out, "_code"), 0)
-    out.set("needs_attention", code != 0)
-    core.emit(public_out(out), "growth")
-    return code
+// 多账户下必须说清"这行结果属于谁"（单账户时 uid 为空 ⇒ 一个字段都不加，输出形状与从前一致 ✓）
+func stamp(Dict[string, any] out, string uid, string label) {
+    if uid != "" { out.set("account", uid) }
+    if label != "" { out.set("label", label) }
+}
+
+// accounts 子命令：列出已归档账号与各自今日状态（**不联网**，状态取自落盘）
+func accounts_report(Array[Array[string]] accounts, Dict[string, any] session, string cur_uid): Dict[string, any] {
+    Array[any] list = []
+    for accounts to a {
+        var st = auto.load_state_of(a[0])
+        var today = "未知"
+        if auto.status_is_today(st) { today = st.today_status }
+        list.add({"uid": a[0], "name": a[1], "auth_file": a[2], "today": today,
+                  "streak": st.streak, "total": st.total, "last_signed": st.signed_date})
+    }
+    Dict[string, any] out = {"result": "ACCOUNTS", "count": accounts.len(), "accounts": list,
+                             "credential_mode": auth.credential_mode(), "needs_attention": false}
+    if cur_uid != "" { out.set("current", cur_uid) }
+    if session != null {
+        var pending = auth.pending_accounts(session)
+        if pending.len() > 0 { out.set("pending_accounts", pending) }
+    }
+    return out
 }
 
 // ==================== 入口 ====================
+// ==================== 入口 ====================
+// 一个账号的一轮（单账户时就是整轮）。返回该账号的退出码。
+func run_one(string action, string uid, string label, string path): int {
+    // ---- doctor：离线自检（不解密、不联网），按账号各查各的 ----
+    if action == "doctor" {
+        var text = ""
+        try { text = auth.read_text(path) } catch e { text = "" }
+        var session = auth.decode_session(text)
+        var out = {}
+        if session == null {
+            out = from_reason("MISSING_SESSION")
+        } else {
+            try { out = auth.doctor_report(session) } catch e { out = from_reason(_str(e.msg)) }
+        }
+        stamp(out, uid, label)
+        core.emit(out, action)
+        var r = jsons.get_str(out, "result", "")
+        if r == "AUTH_READY" { return 0 }
+        if r == "ERROR" { return 2 }
+        return 1
+    }
+
+    var c = auth.connect_path(path)
+    if not c.ok {
+        var out = c.out
+        if out.keys().len() == 0 { out = from_reason(c.err) }
+        var res = jsons.get_str(out, "result", "")
+        stamp(out, uid, label)
+        core.emit(out, action)
+        // NO_AUTH / ERROR 是"环境/用法"级（2），其余（认证被拒、网络…）是"需要关注"级（1）
+        if res == "NO_AUTH" or res == "ERROR" { return 2 }
+        return 1
+    }
+    var cl = c.client
+    if cl == null {
+        var bad = {"result": "ERROR", "report": "内部错误：连接已失效", "needs_attention": true}
+        stamp(bad, uid, label)
+        core.emit(bad, action)
+        return 2
+    }
+
+    // ---- 签到 + 成长中心 ----
+    if auth.in_list(SIMPLE_ACTIONS, action) or auth.in_list(POLL_ACTIONS, action) {
+        var d = run_daily(cl, c.endpoint)
+        if auth.in_list(POLL_ACTIONS, action) {
+            d.out.set("trigger", "poll")
+            // 空跑默认不落盘 —— 一天要跑好几轮，全写进去只会把真正有价值的记录
+            // 淹没在一串"Buddy 旅行中"里。要看完整过程就设 WORKBUDDY_GROWTH_LOG_EMPTY=1。
+            if (not d.quiet) or core.env_flag("WORKBUDDY_GROWTH_LOG_EMPTY") {
+                var o = public_out(d.out)
+                stamp(o, uid, label)
+                core.emit(o, action)
+            }
+            return d.code
+        }
+        var o2 = public_out(d.out)
+        stamp(o2, uid, label)
+        core.emit(o2, action)
+        return d.code
+    }
+
+    // ---- 仅成长中心 ----
+    if action == "growth" {
+        var go = growth.run_growth(cl, c.endpoint)
+        var gcode = core.as_int(core.dig(go, "_code"), 0)
+        go.set("needs_attention", gcode != 0)
+        var pub = public_out(go)
+        stamp(pub, uid, label)
+        core.emit(pub, action)
+        return gcode
+    }
+
+    // ---- 调试命令（原始返回）----
+    var code = 0
+    if action == "status" or action == "all" {
+        var so = debug_status(cl, c.endpoint)
+        stamp(so, uid, label)
+        core.emit(so, action)
+        if core.as_bool(core.dig(so, "needs_attention")) { code = 1 }
+        if action == "status" { return code }
+    }
+    if action == "claim" or action == "all" {
+        var co = debug_claim(cl, c.endpoint)
+        stamp(co, uid, label)
+        core.emit(co, action)
+        if core.as_bool(core.dig(co, "needs_attention")) { code = 1 }
+    }
+    return code
+}
+
 main() {
     var args = _args()
-    var action = "auto"
-    if args.len() > 0 { action = args[0] }
+    var action = ""
+    var only = ""                       // --account <uid>：只跑这一个账号
+    var i = 0
+    while i < args.len() {
+        var a = args[i]
+        if a == "--account" {
+            if i + 1 < args.len() { only = args[i + 1] }
+            i = i + 2
+            continue
+        }
+        if strings.starts_with(a, "--account=") {
+            only = a.slice(10, a.len() - 1)          // "--account=" 占 10 个字符
+            i = i + 1
+            continue
+        }
+        if action == "" { action = a }
+        i = i + 1
+    }
+    if action == "" { action = "auto" }
     // 预算时钟**第一件事**就启动：任何后续失败都要保证还有时间把结果写出去
     core.start_budget(action)
 
@@ -147,117 +275,78 @@ main() {
         _exit(2)
     }
 
-    // ---- 定位凭据 ----
+    // ---- 定位当前登录凭据并**归档**（切号/登出后就再也拿不到了 ⇒ 见一次收一次）----
     var found = auth.find_auth_file()
-    var path = found[0]
-    if path == "" {
-        var override = _env_or("WORKBUDDY_AUTH_FILE", "")
-        var report = ""
-        if override != "" {
-            report = "WORKBUDDY_AUTH_FILE 指向的文件不存在：" + override
-        } else {
-            report = "未找到 WorkBuddy 登录凭据。请先在本机登录 WorkBuddy 桌面端；或设置环境变量 WORKBUDDY_AUTH_FILE 指向 workbuddy-desktop.info。"
-        }
-        var looked = []
-        var i = 1
-        while i < found.len() {
-            looked.add(found[i])
-            i = i + 1
-        }
-        core.emit({"result": "NO_AUTH", "report": report, "looked_in": looked, "needs_attention": true}, action)
-        _exit(2)
-    }
-
-    // ---- 读取 + 解析（两条错误分开报：文件读不到 ≠ JSON 坏了）----
+    var cur_path = found[0]
     var text = ""
-    try {
-        text = auth.read_text(path)
-    } catch e {
-        // 无窗口运行下任何未捕获异常都会让当天的失败无痕消失 ⇒ 这里必须落地
-        core.emit({"result": "ERROR", "report": "读取登录凭据失败（文件被占用或缺权限），请重新登录 WorkBuddy 桌面端"},
-                  action)
-        _exit(2)
+    if cur_path != "" {
+        // 文件读不到（被占用/缺权限）不算致命：下面还有归档副本可用
+        try { text = auth.read_text(cur_path) } catch e { text = "" }
     }
-    var decoded = null
-    try { decoded = jsons.decode(text) } catch e { decoded = null }
-    var session = decoded as Dict[string, any]
-    if session == null {
-        core.emit({"result": "ERROR", "report": "登录凭据文件不是合法 JSON（或内容损坏），请重新登录 WorkBuddy 桌面端"}, action)
-        _exit(2)
-    }
+    var session = auth.decode_session(text)
+    var cur_uid = ""
+    if session != null { cur_uid = auth.archive_session(session, text) }
 
-    // ---- doctor：离线自检（不解密、不联网）----
-    if action == "doctor" {
-        var report = {}
-        try {
-            report = auth.doctor_report(session)
-        } catch e {
-            report = from_reason(_str(e.msg))
+    // ---- 账号列表 ----
+    var accounts = auth.list_accounts()
+    if only != "" {
+        Array[Array[string]] keep = []
+        for accounts to a {
+            if a[0] == only { keep.add(a) }
         }
-        core.emit(report, action)
-        var result = jsons.get_str(report, "result", "")
-        if result == "AUTH_READY" { _exit(0) }
-        if result == "ERROR" { _exit(2) }
-        _exit(1)
-    }
-
-    // ---- 校验 → 取 token → 建客户端 ----
-    var reason = auth.validate_session(session)
-    if reason != "" {
-        core.emit(auth.auth_failure(reason), action)
-        _exit(1)
-    }
-    var token = ""
-    try {
-        token = auth.resolve_token(session, path)
-    } catch e {
-        var rep = from_reason(_str(e.msg))
-        core.emit(rep, action)
-        if jsons.get_str(rep, "result", "") == "ERROR" { _exit(2) }
-        _exit(1)
-    }
-    var headers = []
-    try {
-        headers = auth.build_headers(session, token)
-    } catch e {
-        core.emit(auth.auth_failure("INVALID_FORMAT"), action)
-        _exit(1)
-    }
-    var endpoint = auth.endpoint_of(session)
-    var c = core.new_client(core.REQUEST_TIMEOUT * 1000)
-    c.replaceHeaders(headers)
-
-    // ---- 分发 ----
-    if auth.in_list(SIMPLE_ACTIONS, action) {
-        var d = run_daily(c, endpoint)
-        core.emit(public_out(d.out), action)
-        _exit(d.code)
-    }
-
-    if auth.in_list(POLL_ACTIONS, action) {
-        var d2 = run_daily(c, endpoint)
-        d2.out.set("trigger", "poll")
-        // 空跑默认不落盘 —— 一天要跑好几轮，全写进去只会把真正有价值的记录
-        // 淹没在一串"Buddy 旅行中"里。要看完整过程就设 WORKBUDDY_GROWTH_LOG_EMPTY=1。
-        if (not d2.quiet) or core.env_flag("WORKBUDDY_GROWTH_LOG_EMPTY") {
-            core.emit(public_out(d2.out), action)
+        accounts = keep
+        if accounts.len() == 0 {
+            core.emit({"result": "ERROR",
+                       "report": "没有 uid 为 " + only + " 的已归档账号（用 accounts 子命令看列表）",
+                       "needs_attention": true}, action)
+            _exit(2)
         }
-        _exit(d2.code)
+    }
+    if accounts.len() == 0 {
+        if cur_path == "" {
+            var override = _env_or("WORKBUDDY_AUTH_FILE", "")
+            var report = ""
+            if override != "" {
+                report = "WORKBUDDY_AUTH_FILE 指向的文件不存在：" + override
+            } else {
+                report = "未找到 WorkBuddy 登录凭据。请先在本机登录 WorkBuddy 桌面端；或设置环境变量 WORKBUDDY_AUTH_FILE 指向 workbuddy-desktop.info。"
+            }
+            var looked = []
+            var j = 1
+            while j < found.len() {
+                looked.add(found[j])
+                j = j + 1
+            }
+            core.emit({"result": "NO_AUTH", "report": report, "looked_in": looked, "needs_attention": true}, action)
+            _exit(2)
+        }
+        // 凭据在、但读不出 uid（凭据结构变了之类）⇒ 退化成单账户照跑，不因为归档不了就不干活
+        accounts = [["", "", cur_path]]
     }
 
-    if action == "growth" {
-        _exit(debug_growth(c, endpoint))
+    // ---- accounts：只列不签 ----
+    if action == "accounts" {
+        core.emit(accounts_report(accounts, session, cur_uid), action)
+        _exit(0)
     }
 
-    var code = 0
-    if action == "status" or action == "all" {
-        var sc = debug_status(c, endpoint)
-        if sc != 0 { code = sc }
-        if action == "status" { _exit(code) }
+    // ---- 逐个账号跑：取**最差**退出码（一个账号出错不能被另一个的好结果盖掉）----
+    var overall = 0
+    for accounts to acc {
+        var rc = run_one(action, acc[0], acc[1], acc[2])
+        if rc != 0 { overall = 1 }
     }
-    if action == "claim" or action == "all" {
-        var cc = debug_claim(c, endpoint)
-        if cc != 0 { code = cc }
+
+    // ---- 客户端里还记着、但没收进来的账号：提示一句（不参与判定：元信息不等于 token 还在）----
+    if only == "" and session != null and not strings.starts_with(action, "silent") {
+        var pending = auth.pending_accounts(session)
+        if pending.len() > 0 {
+            core.emit({"result": "PENDING_ACCOUNTS",
+                       "report": "客户端里还有 " + _str(pending.len()) + " 个账号没收进来："
+                                 + strings.join(pending, "、")
+                                 + "；在客户端切换到它登录一次，下次运行就会自动归档",
+                       "pending_accounts": pending}, action)
+        }
     }
-    _exit(code)
+    _exit(overall)
 }

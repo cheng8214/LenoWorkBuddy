@@ -20,6 +20,7 @@ import strings
 import files
 import dirs
 import rands
+import times
 import "wb_core.leno" as core
 import "wb_envelope.leno" as envelope
 use core.(HttpClient)
@@ -179,19 +180,51 @@ function reply(value) {
     process.exit(0);
 }
 
+// 同步小睡：Node 里没有同步 sleep，这里最多等两秒，忙等够用且不依赖任何 API
+function nap(ms) {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* 等 */ }
+}
+
+// 读登录态：客户端刷新 token 时会**短暂独占**这个文件 —— Leno 侧的 read_text 就是为它加了重试，
+// 助手这边同样要加（而且助手还多花了冷启动那几百毫秒，撞上的窗口更大）。
+// 不重试的后果很坑：读失败被外层兜底成 HELPER_PROTOCOL ⇒ 报出来的原因跟真实情况完全对不上。
+function readSession() {
+    let last = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+        try {
+            const session = JSON.parse(fs.readFileSync(AUTH, 'utf8'));
+            if (!object(session) || !object(session.auth)) failure('INVALID_FORMAT');
+            return session;
+        } catch (e) {
+            if (e && e.reason) throw e;              // 我们自己的固定原因码：直接透传
+            last = e;
+            if (attempt < 9) nap(200);               // 撞锁 / 读到半截 ⇒ 等等再读
+        }
+    }
+    throw last;
+}
+
 try {
     if (OP === 'probe') {
         nativeStorage();
         if (!crypto.getCiphers().includes('aes-256-gcm')) failure('RUNTIME_UNAVAILABLE');
         reply({ ok: true, electron: process.versions.electron || 'unknown' });
     }
-    const session = JSON.parse(fs.readFileSync(AUTH, 'utf8'));
-    if (!object(session) || !object(session.auth)) failure('INVALID_FORMAT');
+    const session = readSession();
     reply({ ok: true, accessToken: decrypt(decode(session.auth.accessToken)) });
 } catch (e) {
-    reply({ ok: false, reason: REASONS.includes(e && e.reason) ? e.reason : 'HELPER_PROTOCOL' });
+    // detail 只带**错误代号/类型名**（EBUSY / EACCES / SyntaxError…）：跨进程边界绝不传自由文本
+    //（JSON 解析错误的消息里可能含文件片段）✓
+    reply({ ok: false, reason: REASONS.includes(e && e.reason) ? e.reason : 'HELPER_PROTOCOL',
+            detail: (e && (e.code || e.name)) ? String(e.code || e.name) : '' });
 }
 "
+// 助手最近一次失败回传的**错误代号**（EBUSY / EACCES / SyntaxError…）：只用于错误文案，
+// 不含任何凭据内容（JS 侧只回传 e.code / e.name 这类代号）
+var _helper_detail = ""
+export func helper_detail(): string { return _helper_detail }
+
 var TOKEN_LIMIT = 32768
 export var AUTH_REASONS = ["INVALID_FORMAT", "UNSUPPORTED_ENVELOPE", "RUNTIME_NOT_FOUND",
                     "INVALID_RUNTIME_PATH", "RUNTIME_UNAVAILABLE", "KEY_MISMATCH",
@@ -228,6 +261,146 @@ export func find_auth_file(): Array[string] {
 
 // 带重试的读取：客户端刷新 token 时会**短暂独占**凭据文件，恰好在那一刻读就是失败
 // （实测：定时任务两次撞锁、整轮直接放弃）。锁是瞬时的，等两秒再试即可。
+// ==================== 多账户：凭据归档 ====================
+// 客户端只维护**一份** token（当前登录账号那一个）；它顶层虽然还有 `accounts` /
+// `allAccounts`，但那是**账号元信息**（uid / nickname / phoneNumber…），**不含 token**
+// ⇒ 切号、登出之后，旧账号的凭据就再也拿不到了。
+//
+// 好在那份凭据在**同一台机器**上是自包含的：加密信封 + 每机一把的 at-rest 密钥
+// （keyId 对得上就能解）⇒ 把见过的账号原样复制到本工具自己的目录，之后切号、登出
+// 都不影响它继续签到。**你每在客户端登录一个账号，就自动收进来一个。**
+//
+// 落盘（都在 core.data_root() 下）：
+//   accounts/<uid>.info    凭据文件原样副本（仍是加密信封，不含明文 token）
+//   accounts.json          索引：{"<uid>": {"path": "...", "seen": "2026-10-15", "name": "..."}}
+//
+// 安全：只**复制**、绝不改客户端文件；副本留在本机、不上传；明文 token 只在内存里出现 ✓
+// 代价：换机 / 重装客户端后 at-rest 密钥变了 ⇒ 旧副本 KEY_MISMATCH（重新登录收一次，
+//       或手工提供 WORKBUDDY_AT_REST_KEY 走纯 Leno 路）。
+export func accounts_dir(): string { return dirs.join(core.data_root(), "accounts") }
+export func accounts_index(): string { return dirs.join(core.data_root(), "accounts.json") }
+
+func load_index(): Dict[string, any] {
+    var p = accounts_index()
+    if not files.exists(p) { return {} }
+    var d = null
+    try { d = jsons.decode(files.read(p)) } catch e { return {} }
+    var m = d as Dict[string, any]
+    if m == null { return {} }
+    return m
+}
+
+func save_index(Dict[string, any] m): bool {
+    try {
+        files.write(accounts_index(), jsons.encode(m))
+        return true
+    } catch e {
+        return false
+    }
+}
+
+func today_str(): string { return times.format(times.now(), "%Y-%m-%d") }
+
+// uid 只当文件名用 ⇒ 剔掉路径分隔符等危险字符（uid 本来就很干净，这里是防呆）
+export func safe_uid(string uid): string {
+    var out = ""
+    int i = 0
+    while i < uid.len() {
+        var ch = uid.slice(i, i)
+        var b = ch.byte(0)
+        var keep = (b >= 48 and b <= 57)          // 0-9
+            or (b >= 65 and b <= 90) or (b >= 97 and b <= 122)   // A-Z a-z
+            or b == 45 or b == 95                  // - _
+        if keep { out = out + ch } else { out = out + "_" }
+        i = i + 1
+    }
+    if out == "" { out = "unknown" }
+    return out
+}
+
+export func decode_session(string text): Dict[string, any] {
+    var d = null
+    try { d = jsons.decode(text) } catch e { return null }
+    return d as Dict[string, any]
+}
+
+export func account_uid(Dict[string, any] session): string {
+    var account = session.get("account") as Dict[string, any]
+    if account == null { return "" }
+    return jsons.get_str(account, "uid", "")
+}
+
+// 人看的账号名：昵称 + uid（只有昵称认不出是哪一个、只有 uid 又没法认人，两个一起给）。
+// 昵称常为空（实测本机就是空）⇒ 退到 uin（短号），再没有就直接用 uid。
+export func account_label(Dict[string, any] session): string {
+    var account = session.get("account") as Dict[string, any]
+    if account == null { return "" }
+    var uid = jsons.get_str(account, "uid", "")
+    var nick = jsons.get_str(account, "nickname", "")
+    if nick == "" { nick = jsons.get_str(account, "uin", "") }
+    if nick == "" { return uid }
+    return nick + "（" + uid + "）"
+}
+
+// 把当前登录账号归档一份（幂等：同名覆盖）。返回 uid，失败给 ""
+export func archive_current(string path): string {
+    if path == "" { return "" }
+    var text = ""
+    try { text = read_text(path) } catch e { return "" }
+    var session = decode_session(text)
+    if session == null { return "" }
+    return archive_session(session, text)
+}
+
+export func archive_session(Dict[string, any] session, string text): string {
+    var uid = account_uid(session)
+    if uid == "" { return "" }
+    var dir = accounts_dir()
+    if not dirs.is_dir(dir) {
+        try { dirs.mkdir_p(dir) } catch e { return "" }
+    }
+    var dest = dirs.join(dir, safe_uid(uid) + ".info")
+    try { files.write(dest, text) } catch e { return "" }
+    var idx = load_index()
+    idx.set(uid, {"path": dest, "seen": today_str(), "name": account_label(session)})
+    save_index(idx)
+    return uid
+}
+
+// 已归档账号 → 每项 [uid, label, path]；索引里有、文件已不在的条目自动跳过（防手工删文件）
+export func list_accounts(): Array[Array[string]] {
+    Array[Array[string]] out = []
+    var idx = load_index()
+    for idx.keys() to uid {
+        var e = idx.get(uid) as Dict[string, any]
+        if e == null { continue }
+        var path = jsons.get_str(e, "path", "")
+        if path == "" or not files.exists(path) { continue }
+        out.add([uid, jsons.get_str(e, "name", ""), path])
+    }
+    return out
+}
+
+// 客户端记着"曾登录过"、但本工具还没归档的账号 ⇒ 提示"在客户端切号登录一次就能收进来"。
+// 这是**猜测性提示**（元信息不等于还能签，token 可能早过期），所以只用于文案、不参与判定 ✓
+export func pending_accounts(Dict[string, any] session): Array[string] {
+    Array[string] out = []
+    var known = session.get("accounts")
+    if known is Array => arr {
+        var idx = load_index()
+        for arr to item {
+            var a = item as Dict[string, any]
+            if a == null { continue }
+            var uid = jsons.get_str(a, "uid", "")
+            if uid == "" { continue }
+            if idx.get(uid) != null { continue }
+            var nick = jsons.get_str(a, "nickname", "")
+            if nick == "" { out.add(uid) } else { out.add(nick + "（" + uid + "）") }
+        }
+    }
+    return out
+}
+
 export func read_text(string path): string {
     var tries = 0
     while tries < 3 {
@@ -496,23 +669,30 @@ export func run_helper(string op, string auth_path, string exe): Dict[string, an
     }
     var ready = false
     var waited = 0
+    var reply = null
     while waited < HELPER_TIMEOUT_MS {
-        if files.exists(out) { ready = true; break }
+        // ⚠ 判据是"**内容是合法 JSON**"，不是"文件已存在"：助手是先建文件、后写内容
+        //   （writeFileSync 不是原子的），只等 exists 会读到半截 ⇒ 报出来是 HELPER_PROTOCOL，
+        //   与真实原因对不上，而且是偶发的（磁盘慢 / 杀软扫描时更容易撞上）。
+        if files.exists(out) {
+            var snapshot = ""
+            try { snapshot = files.read(out) } catch e { snapshot = "" }
+            var got = null
+            try { got = jsons.decode(snapshot) } catch e { got = null }
+            if got != null { reply = got; ready = true; break }
+        }
         sleep(50)
         waited = waited + 50
     }
     _kill(handle)
     if not ready { throw "HELPER_TIMEOUT" }
-
-    var text = ""
-    try { text = files.read(out) } catch e { text = "" }
     try { files.delete(out) } catch e { var _cleanup_failed = true }
-    var reply = null
-    try { reply = jsons.decode(text) } catch e { reply = null }
+
     var d = reply as Dict[string, any]
     if d == null { throw "HELPER_PROTOCOL" }
     if core.as_bool(core.dig(d, "ok")) { return d }
     var reason = jsons.get_str(d, "reason", "")
+    _helper_detail = jsons.get_str(d, "detail", "")
     if in_list(AUTH_REASONS, reason) { throw reason }
     throw "HELPER_PROTOCOL"
 }
@@ -574,6 +754,8 @@ struct Conn {
     HttpClient? client = null
     string endpoint = ""
     string auth_path = ""
+    string account = ""                       // 这个连接属于哪个账号（uid；拿不到就给 ""）
+    string label = ""                         // 账号展示名（昵称（uid））
 }
 
 func conn_fail(string code, string text, Dict[string, any] detail): Conn {
@@ -602,20 +784,34 @@ export func connect(): Conn {
             "未找到 WorkBuddy 登录凭据。请先在本机登录 WorkBuddy 桌面端；或设置环境变量 WORKBUDDY_AUTH_FILE 指向 workbuddy-desktop.info。",
             {"looked_in": looked})
     }
+    return connect_path(path)
+}
+
+// 按**指定凭据文件**建连接：多账户逐个跑走这里；单账户时 connect() 只是"先找路径"再进来
+export func connect_path(string path): Conn {
+    if path == "" {
+        return conn_fail("NO_AUTH", "未指定凭据文件（该账号的归档副本可能已被删除）", {})
+    }
+    if not files.exists(path) {
+        return conn_fail("NO_AUTH", "凭据文件不存在：" + path, {"auth_file": path})
+    }
     var text = ""
     try {
         text = read_text(path)
     } catch e {
         return conn_fail("ERROR", "读取登录凭据失败（文件被占用或缺权限），请重新登录 WorkBuddy 桌面端", {})
     }
-    var decoded = null
-    try { decoded = jsons.decode(text) } catch e { decoded = null }
-    var session = decoded as Dict[string, any]
+    var session = decode_session(text)
     if session == null {
         return conn_fail("ERROR", "登录凭据文件不是合法 JSON（或内容损坏），请重新登录 WorkBuddy 桌面端", {})
     }
+    var uid = account_uid(session)
+    var label = account_label(session)
     var reason = validate_session(session)
-    if reason != "" { return new Conn(ok = false, err = reason_text(reason), out = auth_failure(reason), auth_path = path) }
+    if reason != "" {
+        return new Conn(ok = false, err = reason_text(reason), out = auth_failure(reason),
+                        auth_path = path, account = uid, label = label)
+    }
     var token = ""
     try {
         token = resolve_token(session, path)
@@ -623,7 +819,8 @@ export func connect(): Conn {
         var r = _str(e.msg)
         if in_list(AUTH_REASONS, r) or r == "MISSING_SESSION" {
             var f = auth_failure(r)
-            return new Conn(ok = false, err = jsons.get_str(f, "report", ""), out = f, auth_path = path)
+            return new Conn(ok = false, err = jsons.get_str(f, "report", ""), out = f,
+                            auth_path = path, account = uid, label = label)
         }
         return conn_fail("ERROR", "脚本运行异常（" + core.clip(r, 200) + "）", {})
     }
@@ -632,12 +829,14 @@ export func connect(): Conn {
         headers = build_headers(session, token)
     } catch e {
         var f2 = auth_failure("INVALID_FORMAT")
-        return new Conn(ok = false, err = jsons.get_str(f2, "report", ""), out = f2, auth_path = path)
+        return new Conn(ok = false, err = jsons.get_str(f2, "report", ""), out = f2,
+                        auth_path = path, account = uid, label = label)
     }
     var c = core.new_client(core.REQUEST_TIMEOUT * 1000)
     c.replaceHeaders(headers)
     var ep = endpoint_of(session)
-    return new Conn(ok = true, err = "", out = {}, client = c, endpoint = ep, auth_path = path)
+    return new Conn(ok = true, err = "", out = {}, client = c, endpoint = ep,
+                    auth_path = path, account = uid, label = label)
 }
 
 // ==================== ④ 请求头 ====================
@@ -679,7 +878,12 @@ export func reason_text(string reason): string {
     if reason == "KEY_MISMATCH" { return "凭据与所选客户端的密钥不匹配，请用 WORKBUDDY_EXE 指定对应客户端" }
     if reason == "DECRYPT_FAILED" { return "加密凭据认证失败，请检查客户端版本及凭据是否完整" }
     if reason == "HELPER_TIMEOUT" { return "凭据处理超时，已停止子进程，请稍后重试" }
-    if reason == "HELPER_PROTOCOL" { return "客户端凭据助手返回无效结果，请检查客户端和脚本版本" }
+    if reason == "HELPER_PROTOCOL" {
+        // 带上助手回传的错误代号 —— 没有它，这句"无效结果"等于一点线索都没给
+        var extra = ""
+        if _helper_detail != "" { extra = "（助手报告：" + _helper_detail + "）" }
+        return "客户端凭据助手返回无效结果，请检查客户端和脚本版本" + extra
+    }
     if reason == "MISSING_SESSION" { return "本地缺少登录会话或必要字段，请先登录客户端" }
     return "本地未找到有效登录会话，请先登录客户端"
 }

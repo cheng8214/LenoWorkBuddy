@@ -30,12 +30,43 @@ leno wb_sign.leno status         :: 仅查签到状态（调试，原始返回�
 leno wb_sign.leno claim          :: 仅领取签到（调试，幂等）
 leno wb_sign.leno all            :: 查签到状态 + 领取（调试）
 leno wb_sign.leno doctor         :: 离线检查凭据格式与运行时能力，不解密、不联网
+leno wb_sign.leno accounts       :: 列出已归档账号与各自今日状态（不联网）
 ```
 
 > 解释器自己的旗标（`-p` / `-c` / `--no-cache` …）要写在**脚本路径之前**，
 > 脚本路径之后的一切参数都原样交给脚本。
 
 退出码：`0` 成功（含"今日已签"与"非签到季"）／`1` 认证·网络·需要关注的失败／`2` 用法与环境错误。
+多账户下取**最差**的那个（任一账号失败 ⇒ 整体 1），免得一个坏账号被另一个的好结果盖住。
+
+### 多账户
+
+```bat
+leno wb_sign.leno accounts                    :: 列出已归档账号与各自今日状态（不联网）
+leno wb_sign.leno auto                        :: 逐个账号跑（每账号一行 JSON）
+leno wb_sign.leno auto --account <uid>        :: 只跑指定账号
+```
+
+**账号是怎么进来的**：客户端只维护**一份** token —— 当前登录的那个。凭据文件顶层虽然有
+`accounts` / `allAccounts`，但那是**账号元信息**（uid / 昵称 / 手机号…），**不含 token**。
+所以本工具每次运行都会把**当前登录**账号的凭据**归档**一份：
+
+```
+%APPDATA%\LenoWorkBuddy\accounts\<uid>.info   凭据文件原样副本（仍是加密信封，没有明文 token）
+%APPDATA%\LenoWorkBuddy\accounts.json         索引：uid → { 路径, 最近在线日期, 展示名 }
+```
+
+⇒ **你在客户端每登录一个账号，它就自动进列表一次**；之后切号、登出都不影响它继续签到
+（副本是自包含的：同一台机器共用一把 at-rest 密钥，keyId 对得上就能解）。
+
+- 归档只**复制**、绝不改客户端文件；副本留在本机、不上传；明文 token 只在内存里出现。
+- 换机 / 重装客户端后密钥变了 ⇒ 旧副本会 `KEY_MISMATCH`：重新登录收一次，或手工提供
+  `WORKBUDDY_AT_REST_KEY` 走纯 Leno 路。
+- 客户端里还记着、但没收进来的账号，运行结束会多输出一行 `PENDING_ACCOUNTS` 提醒你
+  ——在客户端切到它登录一次即可。
+- 每个账号的"今天已签过"**各自独立**（状态按 uid 分片），一个账号不会把另一个挡住。
+
+> 多账号同机、同出口 IP 连签，属于"能跑通"和"该不该跑"的区别 —— 请自行确认这符合服务条款。
 
 ### 图形界面（窗口 + 托盘）
 
@@ -190,6 +221,17 @@ os_crypt 密钥、凭据管理器与 `HKCU\Software\Tencent` 里也没有。
 > `-e "eval(process.env.WB_HELPER_JS)"`（代码本体走环境变量）。这样打包时
 > **不存在"资源没带上"这个失败面** —— 单文件 exe 与脚本模式是同一份代码。
 
+两个跨进程边界的坑（都踩过，改前别删）：
+
+1. **客户端刷新 token 时会短暂独占凭据文件** —— 助手读它会失败（`EBUSY`/读到半截 JSON）。
+   所以助手内部**自己重试**（10 次 × 200ms），不能一次失败就往外抛：抛出去会被兜底成
+   `HELPER_PROTOCOL`，报出来的原因跟真实情况完全对不上（表现为"时好时坏"）。
+2. **结果文件不是原子的**（助手先建文件、后写内容）⇒ 父进程等的判据必须是
+   "**内容是合法 JSON**"，不能是"文件已存在"，否则会读到半截。
+
+失败时助手会回传一个**错误代号**（`EBUSY`/`EACCES`/`EISDIR`/`SyntaxError`…，只带代号、
+不带任何文件内容），Leno 侧会把它拼进错误文案：`…（助手报告：EBUSY）`。
+
 顺带避开了"路径带空格时 `cmd` 引号被吞"的坑（`_spawn` 会把 exe 与参数分开传）。
 密钥只在那个短命子进程的内存里出现，随即置零；不落盘、不缓存、不回传。
 
@@ -214,6 +256,10 @@ os_crypt 密钥、凭据管理器与 `HKCU\Software\Tencent` 里也没有。
 - **跨天不沿用旧值**：GUI 落盘的"今日状态"带日期（`today_status_date`）。日期不是
   本地今天就一律显示 `今日：待查询（上次 2026-10-14：已签到）`，徽标回 `待查询`
   —— 不再拿昨天的"已签到"冒充今天。
+- **多账户**：按 uid 逐个跑，每账号输出一行 JSON（带 `account` / `label` 字段；单账户时
+  这两个字段**不出现**，输出形状与从前完全一致）；退出码取最差的那个。每个账号的
+  `signed_date` / `today_status` **各自独立**（状态文件按 uid 分片）
+  —— 否则 A 签完写下的"今天已签过"会把 B 当天直接挡掉，而且悄无声息。
 
 差异（有意为之）：
 
@@ -248,8 +294,10 @@ os_crypt 密钥、凭据管理器与 `HKCU\Software\Tencent` 里也没有。
 | `AUTH_ERROR / INVALID_FORMAT` | 凭据结构或令牌格式无效，检查凭据来源与客户端版本 |
 | `AUTH_ERROR / UNSUPPORTED_ENVELOPE` | 加密格式尚不支持：**重新登录不会解决**，要更新脚本 |
 | `AUTH_ERROR / RUNTIME_NOT_FOUND`、`INVALID_RUNTIME_PATH` | 用 `WORKBUDDY_EXE` 指定客户端可执行文件 |
-| `AUTH_ERROR / KEY_MISMATCH`、`DECRYPT_FAILED` | 凭据与所选客户端不是一对（多版本安装时用 `WORKBUDDY_EXE` 明确选） |
-| `AUTH_ERROR / HELPER_TIMEOUT`、`HELPER_PROTOCOL` | 凭据助手超时/返回无效结果。**先看包是不是比源码旧**：助手已内嵌进 `wb_auth.leno`，早于该改动打的 exe 还会去找独立的 `wb_helper.js` ⇒ 重新打包即可。脚本模式下可用 `doctor` 区分（它同样走助手链路，能过就说明代码没问题） |
+| `AUTH_ERROR / KEY_MISMATCH`、`DECRYPT_FAILED` | 凭据与所选客户端不是一对（多版本安装时用 `WORKBUDDY_EXE` 明确选）。多账户下还可能是：该账号的归档副本来自**另一台机器/重装前**（密钥每机生成）⇒ 在客户端重新登录收一次，或手工给 `WORKBUDDY_AT_REST_KEY` |
+| `accounts` 里少了一个账号 | 归档只发生在"它当前登录过"的时候：在客户端切到该账号登录一次，下次运行就会自动收进来（客户端记住的 `accounts` 只有元信息、没有 token） |
+| `AUTH_ERROR / HELPER_TIMEOUT`、`HELPER_PROTOCOL` | 助手超时/返回无效结果。**先看文案末尾的「助手报告：XXX」**：`EBUSY`/`EACCES` = 凭据文件被客户端独占（助手已自己重试 2 秒，一直失败说明客户端在反复写）；`RUNTIME_UNAVAILABLE` = 拿不到客户端原生接口（用 `WORKBUDDY_EXE` 指定对的客户端）；`SyntaxError` = 读到的凭据内容不完整。另确认包不比源码旧（助手已内嵌进 `wb_auth.leno`，早于此改动打的 exe 还在找独立的 `wb_helper.js` ⇒ 重新打包）。脚本模式下可用 `doctor` 区分（它同样走助手链路，能过就说明代码没问题） |
+| 点「查状态」像没反应 | 动作本身会先把状态行置为 `查状态中…`；若一直停在那里，看状态行的报错（多半是上面那条助手问题）。今日状态刷不出来时**不会**显示旧值，而是保持 `今日：待查询（上次 …）` |
 | `AUTH_REJECTED / HTTP 401` | 服务端拒绝认证：检查客户端登录状态、凭据对应的服务地址 |
 | `FORBIDDEN / HTTP 403` | 服务端拒绝操作，检查账号权限或活动条件（**不能**据此判断登录过期） |
 | `INACTIVE / 签到活动未开启` | 非签到季，正常 |
@@ -282,7 +330,7 @@ os_crypt 密钥、凭据管理器与 `HKCU\Software\Tencent` 里也没有。
 | 文件 | 职责 |
 |---|---|
 | `wb_core.leno` | 基础设施：时间预算、HTTP 重试、`dig` 信封取值、标量转换、输出与脱敏 |
-| `wb_auth.leno` | 凭据：定位、校验、两条解密路（纯 Leno / 客户端运行时）、请求头、失败原因人话化、doctor；**内嵌凭据助手源码**（`HELPER_JS`，经 `WB_HELPER_JS` 交给客户端运行时） |
+| `wb_auth.leno` | 凭据：定位、校验、两条解密路（纯 Leno / 客户端运行时）、请求头、失败原因人话化、doctor；**内嵌凭据助手源码**（`HELPER_JS`，经 `WB_HELPER_JS` 交给客户端运行时）；**多账户归档**（`accounts/` + `accounts.json`） |
 | `wb_envelope.leno` | `sym-v1` 信封的**纯 Leno** 解析与解密（密钥派生、AAD 布局、AES-256-GCM），依赖 `LenoCrypto` |
 | `wb_checkin.leno` | 签到：查状态 → 未签才领 → 复取状态 → 汇报（幂等口径都在这里） |
 | `wb_growth.leno` | 成长中心七段；写操作不重试、"常态"不记失败的口径都在这里 |
@@ -299,7 +347,7 @@ os_crypt 密钥、凭据管理器与 `HKCU\Software\Tencent` 里也没有。
 leno test\test_wb_units.leno      :: 纯函数自测（预算夹取 / token 字符集 / 判据 / 日历 / ETA）
 leno test\test_wb_flow.leno       :: 端到端离线回归（自起 stub 服务端，真 HTTP）
 leno test\test_wb_envelope.leno   :: 纯 Leno 解 sym-v1 信封（密钥派生 / AAD 布局 / 篡改拒绝）
-leno test\test_wb_auto.leno       :: 定时判定与配置/状态落盘（时间口径 / 跨天 / 间隔下限 / 坏配置）
+leno test\test_wb_auto.leno       :: 定时判定与配置/状态落盘（时间口径 / 跨天 / 间隔下限 / 坏配置 / 多账户归档与状态分片）
 leno test\test_wb_gui.leno        :: GUI 无头自检（下面那个包装：建窗口 → 逐项断言 → 退出）
 
 :: 密码学侧（Leno 仓库）：FIPS-197 单块 + NIST GCM 用例 + 应用形态向量
@@ -322,7 +370,7 @@ set WORKBUDDY_GUI_SELFTEST=1 & leno wb_gui.leno
 `null_body_signed` / `claim_zerocredit` / `claim_unrecorded` / `unauthorized` / `flaky` /
 `server_error`），把"未签→领取""服务端判已签""**看起来成功但服务端没记上**""401"
 "5xx 重试""低预算不空等"这些**平时撞不上**的路径全跑穿。
-当前：单测 86 项 + 流程 56 项 + 信封 9 项 + 定时/落盘 42 项 + GUI 自检 11 项，全绿。
+当前：单测 86 项 + 流程 65 项 + 信封 9 项 + 定时/落盘 58 项 + GUI 自检 11 项，全绿。
 
 ### 打包
 

@@ -21,6 +21,7 @@ var passed = 0
 var failed = 0
 var leno_exe = ""
 var stub_path = ""
+var sign_path = ""
 var fixture_path = ""
 
 func ok(string name, bool got) {
@@ -48,6 +49,15 @@ func eq_s(string name, string got, string want) {
         failed = failed + 1
         print("✗ " + name + "：期望「" + want + "」，实际「" + got + "」")
     }
+}
+
+// 数一数 haystack 里有多少**行**含 needle（多账户就是"每账号一行"，据此确认跑了几轮）
+func count_text(string haystack, string needle): int {
+    var n = 0
+    for strings.split(haystack, "\n") to line {
+        if line.has(needle) { n = n + 1 }
+    }
+    return n
 }
 
 func lacks_text(string name, string haystack, string needle) {
@@ -94,6 +104,7 @@ func new_authed(Dict[string, any] session, string token, int port): HttpClient {
 main() {
     leno_exe = _executable()
     stub_path = dirs.join(dirs.script_dir(), "wb_stub.leno")
+    sign_path = dirs.join(dirs.dirname(dirs.script_dir()), "wb_sign.leno")
     fixture_path = dirs.join(dirs.join(dirs.script_dir(), "fixtures"), "session.json")
 
     // ---------- 凭据侧（不起 stub 的部分）----------
@@ -287,6 +298,41 @@ main() {
     eq_s("⑮ 复核不了就不算成功", jsons.get_str(a15.out, "result", ""), "UNKNOWN")
     eq_i("⑮ 退出码 1", a15.code, 1)
     _kill(h15)
+
+    // ---------- ⑯ 多账户：一次运行把归档里的账号**逐个**跑到，各输出一行 ----------
+    //    造第二个账号（uid 不同、token 同 —— 对 stub 都是合法请求）；连同 fixture 归档的
+    //    那一个，一共两个 ⇒ 期望两行输出、各带自己的 account 字段。
+    //    数据目录关进临时目录：归档文件不落到真实 %APPDATA% ✓
+    var multi_root = dirs.join(_tmpdir(), "wb_multi")
+    _env("WORKBUDDY_DATA_DIR", multi_root)
+    _env("WORKBUDDY_AUTH_FILE", fixture_path)
+    _env("WORKBUDDY_API_BASE", endpoint(8816))
+    Dict[string, any] s2 = {"account": {"uid": "acc-2", "nickname": "小号"},
+                            "auth": {"accessToken": "stub-token-abc123"}}
+    eq_s("备好第二个账号", auth.archive_session(s2, jsons.encode(s2)), "acc-2")
+    var h16 = start_stub("normal", 8816)
+    sleep(600)
+    var r16 = _exec("\"" + leno_exe + "\" \"" + sign_path + "\" status", 60000)
+    _kill(h16)
+    eq_i("两个账号各跑了一行", count_text(r16.output, "\"account\""), 2)
+    has_text("第一个账号在输出里", r16.output, "11111111-2222-3333-4444-555555555555")
+    has_text("第二个账号在输出里", r16.output, "acc-2")
+
+    // --account <uid>：只跑指定的那一个
+    _env("WORKBUDDY_API_BASE", endpoint(8817))
+    var h17 = start_stub("normal", 8817)
+    sleep(600)
+    var r17 = _exec("\"" + leno_exe + "\" \"" + sign_path + "\" status --account acc-2", 60000)
+    _kill(h17)
+    eq_i("--account 只跑一个", count_text(r17.output, "\"account\""), 1)
+    has_text("--account 命中的是它", r17.output, "acc-2")
+    lacks_text("--account 时另一个不出现", r17.output, "555555555555")
+
+    // 不存在的 uid ⇒ 用法级错误（2），并告诉用户怎么查列表
+    var r18 = _exec("\"" + leno_exe + "\" \"" + sign_path + "\" status --account nope", 60000)
+    eq_i("未知账号按用法错误处理", r18.code, 2)
+    has_text("未知账号提示去查列表", r18.output, "accounts")
+    _env("WORKBUDDY_DATA_DIR", "")
 
     _env("WORKBUDDY_API_BASE", "")
     _env("WORKBUDDY_BUDGET_SECONDS", "")

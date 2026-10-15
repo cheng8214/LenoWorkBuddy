@@ -11,9 +11,7 @@ import strings
 import files
 import dirs
 import times
-import Sys
-
-var APP_DIR = "LenoWorkBuddy"
+import "wb_core.leno" as core
 
 // ==================== 配置 ====================
 export struct AutoCfg {
@@ -40,21 +38,9 @@ export struct AutoState {
     string energy = "—"
 }
 
-// 配置目录：优先系统配置目录（Windows = %APPDATA%），取不到就退回脚本目录
-// （退回是"可写但难看"优于"写不进去" —— 打包成单文件放在 Program Files 时尤其重要）
+// 配置目录：唯一事实来源在 core.data_root()（CLI / GUI / 多账户凭据共用同一个根）；
 // WORKBUDDY_DATA_DIR 是**测试钩子**：自检/回归用它把配置与状态关进临时目录，绝不碰真实文件 ✓
-func data_root(): string {
-    var override = _env_or("WORKBUDDY_DATA_DIR", "").trim()
-    var base = override
-    if base == "" {
-        try { base = Sys.configDir() } catch e { base = "" }
-    }
-    if base == "" { base = dirs.script_dir() }
-    var root = dirs.join(base, APP_DIR)
-    if override != "" { root = base }
-    try { dirs.mkdir_p(root) } catch e { var _mkdir_failed = true }
-    return root
-}
+func data_root(): string { return core.data_root() }
 
 func cfg_path(): string { return dirs.join(data_root(), "wb_gui.json") }
 
@@ -196,17 +182,34 @@ export func poll_hint(AutoCfg c, AutoState st, string today, int now_min): strin
     return "成长中心：约 " + _str(left) + " 分钟后轮询"
 }
 
-// ==================== 状态落盘 ====================
+// ==================== 状态落盘（**按账户分片**）====================
+// 文件形如 {"cur":"<uid>","accounts":{"<uid>":{…}}}
+// 为什么要分片：多账户共用一句"今天已签过"会互相顶掉 —— A 签完写了 signed_date，
+//   轮到 B 就以为今天签过了、直接跳过（B 当天白丢一次机会）。
+// 为什么保留顶层 cur：GUI 只看"当前账户"；旧文件（没有 accounts）也能原样读进来 ✓
 func state_path(): string { return dirs.join(data_root(), "wb_state.json") }
 
-export func load_state(): AutoState {
-    var out = new AutoState()
+func load_top(): Dict[string, any] {
     var path = state_path()
-    if not files.exists(path) { return out }
+    if not files.exists(path) { return {} }
     var d = null
-    try { d = jsons.decode(files.read(path)) } catch e { return out }
+    try { d = jsons.decode(files.read(path)) } catch e { return {} }
     var m = d as Dict[string, any]
-    if m == null { return out }
+    if m == null { return {} }
+    return m
+}
+
+func write_top(Dict[string, any] m): bool {
+    try {
+        files.write(state_path(), jsons.encode(m))
+        return true
+    } catch e {
+        return false
+    }
+}
+
+func parse_state(Dict[string, any] m): AutoState {
+    var out = new AutoState()
     out.signed_date = jsons.get_str(m, "signed_date", "")
     out.last_poll_date = jsons.get_str(m, "last_poll_date", "")
     out.last_poll_min = read_int(m, "last_poll_min", -1)
@@ -220,15 +223,8 @@ export func load_state(): AutoState {
     return out
 }
 
-// 落盘里的"今日状态"是不是**今天**的？旧文件（没这个字段）一律算不是 —— 宁可显示"待查询"，
-// 也不能拿昨天的"已签到"冒充今天。
-export func status_is_today(AutoState s): bool {
-    if s.today_status_date == "" { return false }
-    return s.today_status_date == now_parts()[0]
-}
-
-export func save_state(AutoState s): bool {
-    var m = {
+func state_dict(AutoState s): Dict[string, any] {
+    return {
         "signed_date": s.signed_date,
         "last_poll_date": s.last_poll_date,
         "last_poll_min": s.last_poll_min,
@@ -240,10 +236,65 @@ export func save_state(AutoState s): bool {
         "total": s.total,
         "energy": s.energy
     }
-    try {
-        files.write(state_path(), jsons.encode(m))
-        return true
-    } catch e {
-        return false
+}
+
+// 当前账户（GUI 看它；CLI 跑多账户时逐个显式指定 uid）
+export func current_uid(): string { return jsons.get_str(load_top(), "cur", "") }
+
+export func set_current_uid(string uid): bool {
+    var m = load_top()
+    m.set("cur", uid)
+    return write_top(m)
+}
+
+// 已保存状态的全部账户 uid（顺序 = 文件键序）
+export func state_uids(): Array[string] {
+    Array[string] out = []
+    var acc = load_top().get("accounts") as Dict[string, any]
+    if acc != null {
+        for acc.keys() to k { out.add(k) }
     }
+    return out
+}
+
+export func load_state_of(string uid): AutoState {
+    var m = load_top()
+    var acc = m.get("accounts") as Dict[string, any]
+    if acc != null {
+        var e = acc.get(uid) as Dict[string, any]
+        if e != null { return parse_state(e) }
+        return new AutoState()
+    }
+    // 旧文件（没有 accounts）：整个文件就是那唯一一份状态 —— 只在它确实算本账户时才认，
+    //   否则多账户下 B 会把 A 的"已签到"读成自己的（正是要避免的那种错）
+    if m.keys().len() == 0 { return new AutoState() }
+    var cur = jsons.get_str(m, "cur", "")
+    if uid == "" or uid == cur { return parse_state(m) }
+    return new AutoState()
+}
+
+export func save_state_of(string uid, AutoState s): bool {
+    var m = load_top()
+    var acc = m.get("accounts") as Dict[string, any]
+    if acc == null { acc = {} }
+    acc.set(uid, state_dict(s))
+    m.set("accounts", acc)
+    if jsons.get_str(m, "cur", "") == "" { m.set("cur", uid) }
+    return write_top(m)
+}
+
+// 兼容入口：GUI / 单账户场景只认"当前账户"（签名不变 ⇒ GUI 侧零改动 ✓）
+export func load_state(): AutoState { return load_state_of(current_uid()) }
+
+export func save_state(AutoState s): bool {
+    var uid = current_uid()
+    if uid == "" { uid = "default" }        // 拿不到账户标识也别让状态无处可落
+    return save_state_of(uid, s)
+}
+
+// 落盘里的"今日状态"是不是**今天**的？旧文件（没这个字段）一律算不是 —— 宁可显示"待查询"，
+// 也不能拿昨天的"已签到"冒充今天。
+export func status_is_today(AutoState s): bool {
+    if s.today_status_date == "" { return false }
+    return s.today_status_date == now_parts()[0]
 }
