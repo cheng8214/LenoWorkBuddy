@@ -21,7 +21,7 @@ import "wb_checkin.leno" as checkin
 import "wb_growth.leno" as growth
 import "wb_auto.leno" as auto
 import "wb_tray.leno" as tray
-use SDL3.(Event, Renderer, Scancode, Label, Window, Button, Toggle, Edit, Badge)
+use SDL3.(Event, Renderer, Scancode, Label, Window, Button, Toggle, Edit, Badge, ListBox)
 use auto.(AutoCfg, AutoState)
 
 // ==================== 状态 ====================
@@ -44,6 +44,94 @@ var _c_badge = ""
 var _sfFail = 0
 var _sfPass = 0
 
+// ==================== 账户（多账户）====================
+// 客户端只存**当前登录**那个账号的凭据 ⇒ 每次运行把它归档一份（见 wb_auth）：
+//   列表 = 这些见过的账号。界面只显示**当前选中**账户的今日/统计，操作也都针对它；
+//   要一次全签就走「全部签一遍」。
+Array[Array[string]] ACCOUNTS = []        // 每项 [uid, 展示名, 凭据文件路径]
+int CUR = -1                              // 当前账户下标（-1 = 一个都没有）
+
+func cur_path(): string {
+    if CUR < 0 or CUR >= ACCOUNTS.len() { return "" }
+    return ACCOUNTS[CUR][2]
+}
+
+func cur_uid(): string {
+    if CUR < 0 or CUR >= ACCOUNTS.len() { return "" }
+    return ACCOUNTS[CUR][0]
+}
+
+// 列表里显示的短名：uid 是 36 位 UUID，原样写进一行就放不下了 ⇒ 只留前 8 位
+func short_label(string uid, string label): string {
+    var name = label
+    if name == "" { name = uid }
+    if uid.len() > 9 { name = name.replace(uid, uid.slice(0, 7) + "…") }
+    return name
+}
+
+func cur_title(): string {
+    if CUR < 0 { return "（无账户）" }
+    return short_label(cur_uid(), ACCOUNTS[CUR][1])
+}
+
+// 某账号的今日状态（取自落盘；跨天没刷新的不认 —— 与 refresh_today 同一口径）
+func account_today(string uid): string {
+    var st = auto.load_state_of(uid)
+    if auto.status_is_today(st) { return st.today_status }
+    return "待查询"
+}
+
+func account_line(string uid, string label): string {
+    return short_label(uid, label) + "　·　" + account_today(uid)
+}
+
+// 载入账户列表；并把当前账户对齐到落盘里的 cur（没有就取第一个）
+func load_accounts(): bool {
+    ACCOUNTS = auth.list_accounts()
+    if ACCOUNTS.len() == 0 { CUR = -1; return false }
+    var want = auto.current_uid()
+    CUR = 0
+    var i = 0
+    while i < ACCOUNTS.len() {
+        if ACCOUNTS[i][0] == want { CUR = i }
+        i = i + 1
+    }
+    // 只有一个账号时，把升级前那份"顶层单份"状态搬进来 —— 否则用户的历史（上次签到日期、
+    // 连签/累计）会显示不出来。多个账号时无从判断它属于谁，就不搬（显示"待查询"更诚实）。
+    if ACCOUNTS.len() == 1 { auto.migrate_legacy_state(ACCOUNTS[0][0]) }
+    // 状态文件的 cur 必须与界面选中的账户一致，否则读到的是上一个（或默认桶）
+    auto.set_current_uid(ACCOUNTS[CUR][0])
+    return true
+}
+
+func select_account(int idx) {
+    if idx < 0 or idx >= ACCOUNTS.len() { return }
+    CUR = idx
+    auto.set_current_uid(ACCOUNTS[idx][0])       // 落盘：下次启动默认还是它
+    ST = auto.load_state_of(ACCOUNTS[idx][0])    // 换成这个账号的状态（不换就会把上一个的显示出来）
+}
+
+// 今天已经签过的账号数 —— 定时签到的"完成度"按它算（多账户：全签上才算完成）
+func signed_count(string today): int {
+    var n = 0
+    for ACCOUNTS to a {
+        if auto.load_state_of(a[0]).signed_date == today { n = n + 1 }
+    }
+    return n
+}
+
+// 账户列表控件（建窗时挂上；刷新列表就靠它）
+ListBox? LB_ACC = null
+
+func refresh_accounts() {
+    var lb = LB_ACC
+    if lb == null { return }
+    Array[string] items = []
+    for ACCOUNTS to a { items.add(account_line(a[0], a[1])) }
+    lb.set_items(items)
+    if CUR >= 0 { lb.set_selected(CUR) }
+}
+
 // ==================== 视图刷新（只写变化过的 Label：每帧重建纹理是这个库的已知开销）====================
 func apply_view(Label todayLbl, Label statsLbl, Label statusLbl, Label hintLbl, Badge badge) {
     if _c_today != TODAY_TEXT { todayLbl.set_text(TODAY_TEXT); _c_today = TODAY_TEXT }
@@ -60,8 +148,10 @@ func set_today_status(string s) {
 }
 
 func refresh_today() {
+    // 卡片 A 永远属于**当前选中账户**：账号名放最前面，避免"切了号还以为是上一个的数据"
+    var who = cur_title() + "　"
     if auto.status_is_today(ST) {
-        TODAY_TEXT = "今日：" + ST.today_status
+        TODAY_TEXT = who + "今日：" + ST.today_status
         STATS_TEXT = "连签 " + ST.streak + " 天　累计 " + ST.total + " 积分　能量 " + ST.energy
         BADGE_TEXT = ST.today_status
         return
@@ -72,14 +162,14 @@ func refresh_today() {
     if stale != "" and stale != "未知" {
         var when = "上次"
         if ST.today_status_date != "" { when = "上次 " + ST.today_status_date }
-        TODAY_TEXT = "今日：待查询（" + when + "：" + stale + "）"
+        TODAY_TEXT = who + "今日：待查询（" + when + "：" + stale + "）"
         if ST.streak != "—" or ST.total != "—" or ST.energy != "—" {
             STATS_TEXT = when + "：连签 " + ST.streak + " 天　累计 " + ST.total + " 积分　能量 " + ST.energy
         } else {
             STATS_TEXT = "连签 —　累计 —　能量 —"
         }
     } else {
-        TODAY_TEXT = "今日：待查询"
+        TODAY_TEXT = who + "今日：待查询"
         STATS_TEXT = "连签 —　累计 —　能量 —"
     }
     BADGE_TEXT = "待查询"
@@ -89,7 +179,31 @@ func refresh_hints() {
     var np = auto.now_parts()
     var now_min = auto.parse_hhmm(np[1])
     var today = np[0]
-    HINT_TEXT = auto.signin_hint(CFG, ST, today, now_min) + "　|　" + auto.poll_hint(CFG, ST, today, now_min)
+    var total = ACCOUNTS.len()
+    var done = signed_count(today)
+    var s1 = "定时签到：已关闭"
+    if CFG.signin_on {
+        if total == 0 {
+            s1 = "定时签到：没有账号（先在客户端登录一次）"
+        } else if done >= total {
+            s1 = "定时签到：今天 " + _str(total) + " 个账号都已完成"
+        } else {
+            var at = auto.parse_hhmm(CFG.signin_at)
+            if at < 0 { at = 5 }
+            s1 = "定时签到：" + _str(done) + "/" + _str(total) + " 完成，下次今天 " + auto.fmt_minutes(at)
+            if now_min >= at { s1 = "定时签到：已过 " + auto.fmt_minutes(at) + "，本拍执行" }
+        }
+    }
+    HINT_TEXT = s1 + "　|　" + auto.poll_hint(CFG, ST, today, now_min)
+}
+
+// 定时签到是否该触发：**多账户下"今天全签过"才算完成** —— 否则只签了当前账户，其余账号当天
+// 就再没机会了。判定本身复用 auto.signin_due（把"全签过"伪装成当前账户已签），不改它的口径 ✓
+func signin_due_now(string today, int now_min): bool {
+    if ACCOUNTS.len() == 0 { return false }
+    var probe = new AutoState()
+    if signed_count(today) >= ACCOUNTS.len() { probe.signed_date = today }
+    return auto.signin_due(CFG, probe, today, now_min)
 }
 
 func note_result(string text) {
@@ -103,7 +217,10 @@ func note_result(string text) {
 // ==================== 动作 ====================
 // 连接（找凭据 → 解 token → 建客户端）。失败时把**人话**放进状态行，并返回 ok=false
 func open_conn(): auth.Conn {
-    var c = auth.connect()
+    // 走**当前选中账户**的归档凭据；列表为空（首次运行 / 拿不到 uid）才退回"自动发现当前登录"
+    var p = cur_path()
+    var c = auth.connect_path(p)
+    if p == "" { c = auth.connect() }
     if not c.ok { note_result(c.err) }
     return c
 }
@@ -232,6 +349,68 @@ func do_growth() {
     note_result(jsons.get_str(g, "report", ""))
 }
 
+// 全部账号各签一次。**只签到、不跑成长中心**：成长中心每账号十几条请求，全跑一遍要拖很久；
+// 它仍旧只对当前账户跑（或交给自动化的轮询）。定时到点走的也是这一条。
+func do_signin_all() {
+    if NO_NET { note_result("离线模式：已跳过签到"); return }
+    if ACCOUNTS.len() == 0 {
+        note_result("没有可用账号：先在客户端登录一次，让它自动归档进来")
+        return
+    }
+    STATUS_TEXT = "全部签到中…"
+    var today = auto.now_parts()[0]
+    var okc = 0
+    var badc = 0
+    Array[string] lines = []
+    for ACCOUNTS to a {
+        var uid = a[0]
+        var name = short_label(uid, a[1])
+        var c = auth.connect_path(a[2])
+        if not c.ok {
+            badc = badc + 1
+            lines.add(name + "：" + c.err)
+            continue
+        }
+        var cl = c.client
+        if cl == null {
+            badc = badc + 1
+            lines.add(name + "：连接已失效")
+            continue
+        }
+        var r = checkin.run_auto(cl, c.endpoint)
+        var result = jsons.get_str(r.out, "result", "")
+        var st = auto.load_state_of(uid)
+        st.today_status_date = today
+        // 与 do_signin 同一口径：只有"服务端确认过"才记 signed_date（否则当天留着重试的机会）
+        if result == "CLAIMED" or result == "ALREADY" {
+            st.today_status = "已签到"
+            if not core.as_bool(core.dig(r.out, "needs_attention")) { st.signed_date = today }
+        } else if result == "INACTIVE" {
+            st.today_status = "非签到季"
+        } else if result == "NETWORK" or result == "TIMEOUT" {
+            st.today_status = "网络不可达"
+        } else {
+            st.today_status = "未知"
+        }
+        var sd = core.dig(r.out, "streak_days")
+        if sd != null { st.streak = core.fmt_credit(sd) }
+        var tc = core.dig(r.out, "total_credits")
+        if tc != null { st.total = core.fmt_credit(tc) }
+        var np = auto.now_parts()
+        st.last_text = jsons.get_str(r.out, "report", "")
+        st.last_at = np[0] + " " + np[1]
+        auto.save_state_of(uid, st)
+        if r.code == 0 { okc = okc + 1 } else { badc = badc + 1 }
+        lines.add(name + "：" + st.last_text)
+    }
+    ST = auto.load_state_of(cur_uid())
+    refresh_today()
+    refresh_accounts()
+    var tail = ""
+    if badc > 0 { tail = "，" + _str(badc) + " 个需要关注" }
+    note_result("全部签到：" + _str(okc) + " 个成功" + tail + "　|　" + strings.join(lines, "；"))
+}
+
 // 检查凭据（离线自检：不解密、不联网）
 func do_doctor() {
     var c = open_conn()
@@ -270,8 +449,8 @@ func sched_tick() {
     var np = auto.now_parts()
     var today = np[0]
     var now_min = auto.parse_hhmm(np[1])
-    if auto.signin_due(CFG, ST, today, now_min) {
-        do_signin()
+    if signin_due_now(today, now_min) {
+        do_signin_all()                                // 定时到点：**所有**账号都签（不用逐个配定时）
     } else if auto.poll_due(CFG, ST, today, now_min) {
         do_growth()
     }
@@ -304,8 +483,17 @@ func sf_run() {
     ST.today_status = "已签到"
     ST.today_status_date = "2020-01-01"
     refresh_today()
-    sf_ck(strings.starts_with(TODAY_TEXT, "今日：待查询"), "昨天的已签到不冒充今天（" + TODAY_TEXT + "）")
+    // 卡片 A 现在带账号名前缀（"<账号>　今日：…"）⇒ 用 has 而不是 starts_with
+    sf_ck(TODAY_TEXT.has("今日：待查询"), "昨天的已签到不冒充今天（" + TODAY_TEXT + "）")
     sf_ck(BADGE_TEXT == "待查询", "跨天徽标回到待查询")
+
+    // ---- 多账户 ----
+    sf_ck(ACCOUNTS.len() > 0, "启动时把当前登录账号归档进了列表（" + _str(ACCOUNTS.len()) + " 个）")
+    sf_ck(CUR >= 0 and cur_path() != "", "当前账户已选中且有凭据文件")
+    sf_ck(ACCOUNTS.len() == 0 or account_line(cur_uid(), ACCOUNTS[CUR][1]).has("·"), "列表行带今日状态")
+    sf_ck(short_label("11111111-2222-3333", "甲（11111111-2222-3333）") == "甲（11111111…）",
+          "列表短名把 uid 缩成前 8 位")
+    sf_ck(account_today("no-such-uid") == "待查询", "没见过的账号今日状态算「待查询」")
     ST.today_status = keep_status
     ST.today_status_date = keep_date
     refresh_today()
@@ -340,6 +528,11 @@ main() {
     if AUTO_FRAMES == 0 and not AUTO_SELFTEST { _console(false) }
 
     CFG = auto.load_cfg()
+    // **归档当前登录的账号**：客户端只存当前登录那一份凭据，切号/登出后就再也拿不到了
+    // ⇒ 每次启动先收一份，然后再看列表里都有谁。
+    var found = auth.find_auth_file()
+    if found[0] != "" { auth.archive_current(found[0]) }
+    load_accounts()
     ST = auto.load_state()
     if AUTO_SELFTEST {
         // 自检不碰真实配置：用临时目录 + 临时自启项名
@@ -349,7 +542,7 @@ main() {
     refresh_today()
     refresh_hints()
 
-    var win = SDL3.createWindow({title:"WorkBuddy 签到助手", w:660, h:620, resizable:false})
+    var win = SDL3.createWindow({title:"WorkBuddy 签到助手", w:660, h:760, resizable:false})
     if not win.ok {
         _exit(1)                       // 窗口建不起来就没得玩；GUI 侧没有控制台，打印也没人看
     }
@@ -361,59 +554,72 @@ main() {
                                   text_color:#C8D2E6FF, border_color:#505564FF})
     win.add(badge)
 
-    // ---- 卡片 A：今日 ----
+    // ---- 卡片 A：今日（属于**当前选中账户**）----
     var cardA = win.addPanel({x:24, y:56, w:612, h:104, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
     var todayLbl = SDL3.createLabel({x:44, y:74, text:TODAY_TEXT, font_size:17, text_color:#DCE6FFFF})
     cardA.add(todayLbl)
     var statsLbl = SDL3.createLabel({x:44, y:110, text:STATS_TEXT, font_size:14, text_color:#B4C8FFFF})
     cardA.add(statsLbl)
 
+    // ---- 卡片 账户：列表（点一行就切过去）----
+    var cardAcc = win.addPanel({x:24, y:172, w:612, h:150, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
+    cardAcc.add(SDL3.createLabel({x:44, y:188, text:"账户", font_size:15, text_color:#B4C8FFFF}))
+    var btnAll = SDL3.createButton({x:470, y:184, w:146, h:32, text:"全部签一遍", font_size:14,
+                                    tip:"对列表里每个账号各签到一次（只签到，不跑成长中心）"})
+    cardAcc.add(btnAll)
+    var lbAcc = win.addListBox({x:44, y:222, w:572, h:94, item_h:30, font_size:14,
+        bg_color:#14161DFF, border_color:#505564FF, sel_color:#2B3D63FF, hover_color:#232733FF,
+        text_color:#C8D2E6FF, tip:"点一行即切换账号（自动查一次它的今日状态）"})
+    cardAcc.add(lbAcc)
+    LB_ACC = lbAcc
+    refresh_accounts()
+
     // ---- 卡片 B：操作 ----
-    var cardB = win.addPanel({x:24, y:172, w:612, h:96, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
-    var btnSignin = SDL3.createButton({x:44, y:196, w:150, h:44, text:"立即签到", type:"primary",
-                                       font_size:15, tip:"签到 + 成长中心（幂等，重复点只是多查一次）"})
+    var cardB = win.addPanel({x:24, y:334, w:612, h:96, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
+    var btnSignin = SDL3.createButton({x:44, y:358, w:150, h:44, text:"立即签到", type:"primary",
+                                       font_size:15, tip:"当前账户：签到 + 成长中心（幂等，重复点只是多查一次）"})
     cardB.add(btnSignin)
-    var btnStatus = SDL3.createButton({x:206, y:196, w:130, h:44, text:"查状态", font_size:15,
-                                       tip:"只查询今日签到状态与连签/累计/能量"})
+    var btnStatus = SDL3.createButton({x:206, y:358, w:130, h:44, text:"查状态", font_size:15,
+                                       tip:"当前账户：只查询今日签到状态与连签/累计/能量"})
     cardB.add(btnStatus)
-    var btnGrowth = SDL3.createButton({x:348, y:196, w:130, h:44, text:"领成长奖励", font_size:15,
-                                       tip:"只要成长中心：旅行礼物 / 任务奖 / 补登 / 连登兑换 / 盲盒"})
+    var btnGrowth = SDL3.createButton({x:348, y:358, w:130, h:44, text:"领成长奖励", font_size:15,
+                                       tip:"当前账户：只要成长中心（旅行礼物 / 任务奖 / 补登 / 连登兑换 / 盲盒）"})
     cardB.add(btnGrowth)
-    var btnDoctor = SDL3.createButton({x:490, y:196, w:126, h:44, text:"检查凭据", font_size:15,
-                                       tip:"离线自检：凭据格式 + 解密能力（不联网）"})
+    var btnDoctor = SDL3.createButton({x:490, y:358, w:126, h:44, text:"检查凭据", font_size:15,
+                                       tip:"当前账户：离线自检凭据格式 + 解密能力（不联网）"})
     cardB.add(btnDoctor)
 
     // ---- 卡片 C：自动化 ----
-    var cardC = win.addPanel({x:24, y:280, w:612, h:236, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
-    cardC.add(SDL3.createLabel({x:44, y:296, text:"自动化", font_size:15, text_color:#B4C8FFFF}))
+    var cardC = win.addPanel({x:24, y:442, w:612, h:236, bg_color:#1C1E26FF, radius:10, border_color:#505564FF})
+    cardC.add(SDL3.createLabel({x:44, y:458, text:"自动化", font_size:15, text_color:#B4C8FFFF}))
 
-    var tglAuto = SDL3.createToggle({x:44, y:326, w:52, h:28, on:tray.autostart_on(), tip:"开机自动启动本程序（启动即只留托盘）"})
+    var tglAuto = SDL3.createToggle({x:44, y:488, w:52, h:28, on:tray.autostart_on(), tip:"开机自动启动本程序（启动即只留托盘）"})
     cardC.add(tglAuto)
-    cardC.add(SDL3.createLabel({x:108, y:331, text:"开机自启动", font_size:15, text_color:#DCE6FFFF}))
+    cardC.add(SDL3.createLabel({x:108, y:493, text:"开机自启动", font_size:15, text_color:#DCE6FFFF}))
 
-    var tglSignin = SDL3.createToggle({x:44, y:366, w:52, h:28, on:CFG.signin_on, tip:"每天到点自动签到（程序在跑即生效）"})
+    var tglSignin = SDL3.createToggle({x:44, y:528, w:52, h:28, on:CFG.signin_on, tip:"每天到点自动签到**全部账号**（程序在跑即生效）"})
     cardC.add(tglSignin)
-    cardC.add(SDL3.createLabel({x:108, y:371, text:"定时签到", font_size:15, text_color:#DCE6FFFF}))
-    var edtTime = SDL3.createEdit({x:196, y:366, w:76, h:30, text:CFG.signin_at, font_size:15, tip:"每天几点（HH:MM，本地时间）"})
+    cardC.add(SDL3.createLabel({x:108, y:533, text:"定时签到", font_size:15, text_color:#DCE6FFFF}))
+    var edtTime = SDL3.createEdit({x:196, y:528, w:76, h:30, text:CFG.signin_at, font_size:15, tip:"每天几点（HH:MM，本地时间）"})
     cardC.add(edtTime)
 
-    var tglPoll = SDL3.createToggle({x:300, y:366, w:52, h:28, on:CFG.poll_on, tip:"按间隔轮询成长中心（领旅行礼物/任务奖等）"})
+    var tglPoll = SDL3.createToggle({x:300, y:528, w:52, h:28, on:CFG.poll_on, tip:"按间隔轮询成长中心（领旅行礼物/任务奖等，只针对当前账户）"})
     cardC.add(tglPoll)
-    cardC.add(SDL3.createLabel({x:364, y:371, text:"轮询（分钟）", font_size:15, text_color:#DCE6FFFF}))
-    var edtPoll = SDL3.createEdit({x:478, y:366, w:70, h:30, text:_str(CFG.poll_minutes), font_size:15, tip:"间隔分钟数（≥5）"})
+    cardC.add(SDL3.createLabel({x:364, y:533, text:"轮询（分钟）", font_size:15, text_color:#DCE6FFFF}))
+    var edtPoll = SDL3.createEdit({x:478, y:528, w:70, h:30, text:_str(CFG.poll_minutes), font_size:15, tip:"间隔分钟数（≥5）"})
     cardC.add(edtPoll)
 
-    var tglTray = SDL3.createToggle({x:44, y:412, w:52, h:28, on:CFG.close_to_tray, tip:"点关闭按钮时收进托盘而不是退出"})
+    var tglTray = SDL3.createToggle({x:44, y:574, w:52, h:28, on:CFG.close_to_tray, tip:"点关闭按钮时收进托盘而不是退出"})
     cardC.add(tglTray)
-    cardC.add(SDL3.createLabel({x:108, y:417, text:"关窗收进托盘", font_size:15, text_color:#DCE6FFFF}))
+    cardC.add(SDL3.createLabel({x:108, y:579, text:"关窗收进托盘", font_size:15, text_color:#DCE6FFFF}))
 
-    var hintLbl = SDL3.createLabel({x:44, y:462, text:HINT_TEXT, font_size:13, text_color:#8A93A6FF})
+    var hintLbl = SDL3.createLabel({x:44, y:624, text:HINT_TEXT, font_size:13, text_color:#8A93A6FF})
     cardC.add(hintLbl)
 
     // ---- 底部状态行 ----
-    var statusLbl = SDL3.createLabel({x:24, y:532, text:STATUS_TEXT, font_size:14, text_color:#B4C8FFFF})
+    var statusLbl = SDL3.createLabel({x:24, y:696, text:STATUS_TEXT, font_size:14, text_color:#B4C8FFFF})
     win.add(statusLbl)
-    var modeLbl = SDL3.createLabel({x:24, y:562, text:"凭据模式：" + auth.credential_mode()
+    var modeLbl = SDL3.createLabel({x:24, y:726, text:"凭据模式：" + auth.credential_mode()
         + "　|　托盘：右键 = 菜单，左键 = 显示/隐藏", font_size:12, text_color:#7A8396FF})
     win.add(modeLbl)
 
@@ -422,6 +628,15 @@ main() {
     btnStatus.on_click(func():void { do_status(); refresh_hints() })
     btnGrowth.on_click(func():void { do_growth(); refresh_hints() })
     btnDoctor.on_click(func():void { do_doctor() })
+    btnAll.on_click(func():void { do_signin_all(); refresh_hints() })
+    // 点账户列表某一行 ⇒ 切当前账户（卡片 A/B 的一切操作随之换人）
+    lbAcc.on_change(func(Array[int] idx) {
+        if idx.len() == 0 { return }
+        select_account(idx[0])
+        refresh_today()
+        refresh_hints()
+        do_status()          // 切过去顺手查一次：否则看到"待查询"还得再点一下「查状态」
+    })
 
     tglAuto.on_change(func(bool on) {
         if tray.set_autostart(on) {

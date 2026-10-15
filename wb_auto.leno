@@ -278,9 +278,27 @@ export func save_state_of(string uid, AutoState s): bool {
     var acc = m.get("accounts") as Dict[string, any]
     if acc == null { acc = {} }
     acc.set(uid, state_dict(s))
-    m.set("accounts", acc)
-    if jsons.get_str(m, "cur", "") == "" { m.set("cur", uid) }
-    return write_top(m)
+    // 只写新结构（cur + accounts）：老格式那份顶层字段在迁移后就没人读了，
+    // 留在文件里只会让人以为它还有用。迁移（migrate_legacy_state）已经在单账号时抢先做过，
+    // 所以这里丢掉它不会丢数据 ✓
+    Dict[string, any] out = {"accounts": acc}
+    var cur = jsons.get_str(m, "cur", "")
+    if cur == "" { cur = uid }
+    out.set("cur", cur)
+    return write_top(out)
+}
+
+// 老格式状态（升级前那份"顶层单份"，没有 accounts）迁移到某个账户名下。
+// 只在**顶层确实有内容、且还是老格式**时搬；搬完 cur 指向该账户，顶层那份自然不再被读 ✓
+// （调用方负责判断"能不能确定它属于谁" —— 多账户时无从判断，就别搬）
+export func migrate_legacy_state(string uid): bool {
+    if uid == "" { return false }
+    var m = load_top()
+    if m.keys().len() == 0 { return false }
+    if m.get("accounts") != null { return false }
+    var s = parse_state(m)
+    if s.signed_date == "" and s.today_status == "未知" and s.last_at == "" { return false }
+    return save_state_of(uid, s)
 }
 
 // 兼容入口：GUI / 单账户场景只认"当前账户"（签名不变 ⇒ GUI 侧零改动 ✓）

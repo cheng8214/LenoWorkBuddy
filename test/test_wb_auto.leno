@@ -184,8 +184,15 @@ main() {
 
     // 旧格式（单账户、没有 accounts）还得能读 —— 升级不该把用户已有的状态读丢
     files.write(dirs.join(_env_or("WORKBUDDY_DATA_DIR", ""), "wb_state.json"),
-        "{\"signed_date\":\"2026-10-14\",\"today_status\":\"已签到\"}")
+        "{\"signed_date\":\"2026-10-14\",\"today_status\":\"已签到\",\"streak\":\"13\"}")
     eq_s("旧格式状态仍可读", auto.load_state().signed_date, "2026-10-14")
+
+    // 老格式迁移：只有一个账号时，把升级前那份顶层状态搬到它名下（否则历史显示不出来）
+    ck("迁移老状态到该账号", auto.migrate_legacy_state("uid-Z"))
+    eq_s("迁移后该账号有签到日期", auto.load_state_of("uid-Z").signed_date, "2026-10-14")
+    eq_s("迁移后连签保留", auto.load_state_of("uid-Z").streak, "13")
+    ck("已是新格式 ⇒ 不再重复迁移", not auto.migrate_legacy_state("uid-Z"))
+    ck("拿不到 uid ⇒ 不迁移", not auto.migrate_legacy_state(""))
 
     print("")
     print("通过 " + _str(passed) + " / 失败 " + _str(failed))
