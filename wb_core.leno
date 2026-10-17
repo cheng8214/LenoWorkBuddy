@@ -12,6 +12,7 @@ import dirs
 import times
 import Sys
 import "web_net" as net
+import "Log" as log      // 2026-10-17：日志追加收编（raw 模式，行格式不变）
 use net.(HttpClient, Response)
 
 // ==================== 常量 ====================
@@ -372,22 +373,20 @@ export func emit(Dict[string, any] out, string action) {
             var _stdout_down = true
         }
     }
-    var line = "[" + now_text() + "] " + payload + "\n"
+    var line = "[" + now_text() + "] " + payload
     var default_log = dirs.join(dirs.script_dir(), "signin.log")
     var custom = _env_or("WORKBUDDY_SIGNIN_LOG", "")
-    var paths = []
+    Array[string] paths = []
     if custom != "" { paths.add(custom) }
     paths.add(default_log)
-    // 自定义路径不可写时回退到脚本同目录，避免无窗口运行下结果彻底丢失
+    // 自定义路径不可写时回退到脚本同目录，避免无窗口运行下结果彻底丢失。
+    // 2026-10-17：追加动作收编到 LenoLog 的 raw()（**不加**时间戳/等级，行格式与以前
+    //   逐字节一致 —— 这行是**给机器解析的记录**，不是给人看的诊断日志）；
+    //   写失败由模块吞掉并返回 false ⇒ 这里继续试下一条路径。
     for paths to p {
-        try {
-            var f = files.open(p, "a")
-            f.write(line)
-            f.close()
-            return
-        } catch e {
-            var _log_failed = p
-        }
+        var lg = log.create("workbuddy", 20)
+        log.addFile(lg, p)
+        if log.raw(lg, line) { return }
     }
 }
 

@@ -8,7 +8,9 @@
 // 而这条路本来就是"从磁盘读一个 base64 文本"，走文件才是真实用法。
 import files
 import strings
-import "web_gzip" as gz
+// 2026-10-17：原先直接 import LenoWeb 的**内部文件** `web_gzip`（跨包耦合）；
+//   解压实现已收编到独立模块 LenoCompress，API 完全一致（gunzip/isGzip 同签名）。
+import "Compress" as gz
 
 main() {
     var args = _args()
