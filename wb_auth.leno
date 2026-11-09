@@ -870,22 +870,28 @@ export func build_headers(Dict[string, any] session, string token): Array[string
 
 // ==================== ⑤ 失败原因 → 人话 ====================
 export func reason_text(string reason): string {
-    if reason == "INVALID_FORMAT" { return "登录凭据格式无效，请检查凭据来源和客户端版本" }
-    if reason == "UNSUPPORTED_ENVELOPE" { return "尚不支持此加密凭据格式，请更新脚本；重新登录不会改变加密格式" }
-    if reason == "RUNTIME_NOT_FOUND" { return "未找到 WorkBuddy 客户端，请用 WORKBUDDY_EXE 指定其可执行文件" }
-    if reason == "INVALID_RUNTIME_PATH" { return "WORKBUDDY_EXE 不是可用的可执行文件，请核对路径" }
-    if reason == "RUNTIME_UNAVAILABLE" { return "客户端运行时不支持所需的原生存储接口，请检查客户端和脚本版本" }
-    if reason == "KEY_MISMATCH" { return "凭据与所选客户端的密钥不匹配，请用 WORKBUDDY_EXE 指定对应客户端" }
-    if reason == "DECRYPT_FAILED" { return "加密凭据认证失败，请检查客户端版本及凭据是否完整" }
-    if reason == "HELPER_TIMEOUT" { return "凭据处理超时，已停止子进程，请稍后重试" }
-    if reason == "HELPER_PROTOCOL" {
-        // 带上助手回传的错误代号 —— 没有它，这句"无效结果"等于一点线索都没给
-        var extra = ""
-        if _helper_detail != "" { extra = "（助手报告：" + _helper_detail + "）" }
-        return "客户端凭据助手返回无效结果，请检查客户端和脚本版本" + extra
+    // ★ 2026-11-09：9 个 `if reason == "..."` 链改用 `switch` —— 一眼看出这是
+    //   "错误代号 → 人话"的查表，加新代号只需加一个 case（不会再往链尾接）。
+    //   等价性：switch **自动 break**（实测），各 case 与原 if 一一对应；
+    //   原来的最后一句 `return "本地未找到..."` 就是 `default` ✓
+    switch reason {
+        case "INVALID_FORMAT" { return "登录凭据格式无效，请检查凭据来源和客户端版本" }
+        case "UNSUPPORTED_ENVELOPE" { return "尚不支持此加密凭据格式，请更新脚本；重新登录不会改变加密格式" }
+        case "RUNTIME_NOT_FOUND" { return "未找到 WorkBuddy 客户端，请用 WORKBUDDY_EXE 指定其可执行文件" }
+        case "INVALID_RUNTIME_PATH" { return "WORKBUDDY_EXE 不是可用的可执行文件，请核对路径" }
+        case "RUNTIME_UNAVAILABLE" { return "客户端运行时不支持所需的原生存储接口，请检查客户端和脚本版本" }
+        case "KEY_MISMATCH" { return "凭据与所选客户端的密钥不匹配，请用 WORKBUDDY_EXE 指定对应客户端" }
+        case "DECRYPT_FAILED" { return "加密凭据认证失败，请检查客户端版本及凭据是否完整" }
+        case "HELPER_TIMEOUT" { return "凭据处理超时，已停止子进程，请稍后重试" }
+        case "HELPER_PROTOCOL" {
+            // 带上助手回传的错误代号 —— 没有它，这句"无效结果"等于一点线索都没给
+            var extra = ""
+            if _helper_detail != "" { extra = "（助手报告：" + _helper_detail + "）" }
+            return "客户端凭据助手返回无效结果，请检查客户端和脚本版本" + extra
+        }
+        case "MISSING_SESSION" { return "本地缺少登录会话或必要字段，请先登录客户端" }
+        default { return "本地未找到有效登录会话，请先登录客户端" }
     }
-    if reason == "MISSING_SESSION" { return "本地缺少登录会话或必要字段，请先登录客户端" }
-    return "本地未找到有效登录会话，请先登录客户端"
 }
 
 // 结果码：MISSING_SESSION ⇒ NO_SESSION（"没登录"），其余 ⇒ AUTH_ERROR（"凭据本身有问题"）
