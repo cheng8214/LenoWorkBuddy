@@ -13,6 +13,8 @@ import times
 import Sys
 import "WebNet" as net
 import "Log" as log      // 2026-10-17：日志追加收编（raw 模式，行格式不变）
+// ★ 2026-11-10（P2）：数值解析从自造的 Num 结构改成标准 Option[float]
+import "Result" as rstd
 use net.(HttpClient, Response)
 
 // ==================== 常量 ====================
@@ -82,22 +84,22 @@ export func parse_budget(float fallback, float maximum): Budget {
     var raw = _env_or("WORKBUDDY_BUDGET_SECONDS", "")
     if raw == "" { return new Budget(seconds = fallback, warning = "") }
     var parsed = try_float(raw)
-    if not parsed.ok {
+    if parsed.isNone() {
         return new Budget(seconds = fallback,
             warning = "WORKBUDDY_BUDGET_SECONDS=" + raw + " 不是数字，已回落 " + _str(_int(fallback)) + " 秒")
     }
-    if parsed.value <= 0.0 {
+    if parsed.val <= 0.0 {
         // "0" 是非空字符串，用 `or` 兜不住；且 0 会让每个请求都直接放弃，脚本永久失效
         return new Budget(seconds = fallback,
             warning = "WORKBUDDY_BUDGET_SECONDS=" + raw + " 必须为正数，已回落 " + _str(_int(fallback)) + " 秒")
     }
-    if parsed.value > maximum {
+    if parsed.val > maximum {
         // 上限同样是硬要求：预算大于任务时限就等于没有预算，黑洞式超时会把进程跑到被强杀
         return new Budget(seconds = maximum,
             warning = "WORKBUDDY_BUDGET_SECONDS=" + raw + " 超过本命令上限，已夹到 " + _str(_int(maximum))
                       + " 秒（须小于该定时任务的 ExecutionTimeLimit）")
     }
-    return new Budget(seconds = parsed.value, warning = "")
+    return new Budget(seconds = parsed.val, warning = "")
 }
 
 // 轮询类命令（silent-poll / silent-growth）预算更短、上限更低
@@ -248,17 +250,13 @@ export func dig(Dict[string, any] obj, string key): any {
 // ---- 标量安全转换 ----
 // ⚠ 这里**不用 try/catch 试探**：`_int("12x")` 这类失败在本机是"静默给 0"，
 //   靠异常分不出来 ⇒ 一律先看类型、再做字符校验，语义才可预测 ✓
-struct Num {
-    bool ok = false
-    float value = 0.0
-}
-
-func try_float(string s): Num {
+// 解析失败 = "没有值"（不是 0.0）⇒ 用标准 Option，别再造 `Num{ok, value}` 这种小 Result
+func try_float(string s): rstd.Option[float] {
     var t = s.trim()
-    if t == "" { return new Num(ok = false, value = 0.0) }
+    if t == "" { return rstd.none[float]() }
     var f = 0.0
-    try { f = _float(t) } catch e { return new Num(ok = false, value = 0.0) }
-    return new Num(ok = true, value = f)
+    try { f = _float(t) } catch e { return rstd.none[float]() }
+    return rstd.some(f)
 }
 
 // 纯整数串（可带前导 -）⇒ <0, true>
@@ -287,7 +285,7 @@ export func as_int(any v, int fallback): int {
         var t = s.trim()
         if is_int_str(t) { return _int(t) }
         var f = try_float(t)
-        if f.ok { return _int(f.value) }   // 兼容 "1.5"/"1e3"：宁可截断，也不把真实数值丢成 0
+        if f.isSome() { return _int(f.val) }   // 兼容 "1.5"/"1e3"：宁可截断，也不把真实数值丢成 0
         return fallback
     }
     return fallback
@@ -299,7 +297,7 @@ export func as_float(any v, float fallback): float {
     if v is int => i { return _float(i) }
     if v is string => s {
         var f = try_float(s)
-        if f.ok { return f.value }
+        if f.isSome() { return f.val }
     }
     return fallback
 }
