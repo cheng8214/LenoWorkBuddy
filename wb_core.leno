@@ -11,7 +11,7 @@ import files
 import dirs
 import times
 import Sys
-import "web_net" as net
+import "WebNet" as net
 import "Log" as log      // 2026-10-17：日志追加收编（raw 模式，行格式不变）
 use net.(HttpClient, Response)
 
