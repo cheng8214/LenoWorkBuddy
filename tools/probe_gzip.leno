@@ -30,19 +30,24 @@ main() {
     // ⚠ 二进制串上 len() 是**字符数**、byte_len() 才是字节数（本探针第一版就踩了：146 字节报成 127）
     print("② base64 解码后 byte_len=" + _str(strings.byte_len(raw)) + " len=" + _str(raw.len()))
 
+    // ★ 2026-11-11：gunzip 统一返回 `Result[Inflated]`（P2 契约收敛）——
+    //   载荷（data / inBytes / outBytes）在 `.val` 里，失败原因在 `.msg`（旧的自造
+    //   `{ok,inBytes,outBytes,data,error}` 已不在 Compress 的公开 API 里）。
     var r = gz.gunzip(raw)
-    print("③ gunzip ok=" + _str(r.ok) + " in=" + _str(r.inBytes) + " out=" + _str(r.outBytes) + " err=" + r.error)
+    print("③ gunzip ok=" + _str(r.ok) + " msg=" + r.msg)
     if not r.ok { _exit(1) }
+    var g = r.val
+    print("   in=" + _str(g.inBytes) + " out=" + _str(g.outBytes))
 
     if args.len() > 1 {
         var want = files.read(args[1])
         var verdict = "不一致"
-        if r.data == want { verdict = "逐字节一致" }
+        if g.data == want { verdict = "逐字节一致" }
         print("④ 与原文比对: " + verdict + "（原文 " + _str(want.len()) + " 字节）")
     }
 
     // take(start, n)：按**字符个数**取（slice 是闭区间，容易差一位；纯展示用 take 更省心）
-    var head = r.data.take(0, 100)
+    var head = g.data.take(0, 100)
     print("⑤ 解出内容头部: " + head)
     _exit(0)
 }
