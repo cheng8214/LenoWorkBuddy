@@ -318,7 +318,7 @@ export func safe_uid(string uid): string {
     return out
 }
 
-export func decode_session(string text): Dict[string, any] {
+export func decode_session(string text): Dict[string, any]? {
     var d = null
     try { d = jsons.decode(text) } catch e { return null }
     return d as Dict[string, any]

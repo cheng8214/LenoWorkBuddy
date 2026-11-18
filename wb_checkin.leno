@@ -208,7 +208,7 @@ export func run_auto(HttpClient c, string endpoint): RunOut {
 //
 // ⚠ 这里特意**不**用旧状态兜底：旧的 today_checked_in 是领取前的，拿它顶替会让
 //   "服务端到底记没记上"永远为真 —— 那正是假成功的来源。
-func confirm_status(HttpClient c, string endpoint): Dict[string, any] {
+func confirm_status(HttpClient c, string endpoint): Dict[string, any]? {
     var r = fetch_status(c, endpoint)
     if ok_code(r.code) { return r.body }
     return null

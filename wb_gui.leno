@@ -435,7 +435,7 @@ func err_like(string result): bool {
     return false
 }
 
-func load_session_quiet(string path): Dict[string, any] {
+func load_session_quiet(string path): Dict[string, any]? {
     var text = ""
     try { text = auth.read_text(path) } catch e { return null }
     var d = null
